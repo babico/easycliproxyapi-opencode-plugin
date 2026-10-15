@@ -2,31 +2,23 @@
 
 ### Fix
 
-- Attach the replayed chain of thought to every assistant message of its own turn. A Responses assistant turn can span several Chat Completions messages — one per assistant text message, plus the tool-call message that carries the calls — and the replay used to stop at the first one, so the message carrying `tool_calls` went out without `reasoning_content`: the shape a DeepSeek endpoint rejects with HTTP 400 `The reasoning_content in the thinking mode must be passed back to the API.` The turn's reasoning is dropped at a turn boundary (a user, system or developer message, or the tool result that closes the turn), and a fresh reasoning item opens a new assistant output whose calls carry the new chain of thought in their own message.
-- The replay stays limited to the `deepseek*` family, so every other Chat Completions-routed model keeps the wire shape of earlier releases. The Anthropic Messages route needs no change: one Anthropic turn is already one Chat Completions message.
-
-### Verification
-
-- `internal/adapter/chatcompletions/request_test.go` covers a turn that holds text and tool calls in both arrival orders, a text message between two calls, the turn boundaries, the mid-turn reasoning item, and the unchanged tool-call merge shape for a non-replay model.
-
-
-### Change
-
-- Limit the client → upstream reasoning replay (added in v0.1.15) to the upstream families whose Chat Completions endpoints actually require it: the `deepseek*` models. Replayed reasoning items and Anthropic `thinking` blocks still become `reasoning_content` there, and still never do for any other Chat Completions-routed model (`glm*`, `kimi*`, `mimo*`, `hy*`, `longcat*`), which keep the exact wire shape of earlier releases.
-- The upstream → client direction is deliberately left ungated: it only forwards a chain of thought the upstream actually streamed, so it cannot fail a request, and it keeps working for every model that emits the field.
+- Attach the replayed chain of thought to every assistant message of its own turn. A Responses assistant turn can span several Chat Completions messages — one per assistant text message, plus the tool-call message that carries the calls — and the replay used to stop at the first one, so the message carrying `tool_calls` went out without `reasoning_content`: the shape a DeepSeek endpoint rejects with HTTP 400 `The reasoning_content in the thinking mode must be passed back to the API.` The turn's reasoning is now dropped only at a real boundary (a user, system or developer message, or the tool result that closes the turn), and a fresh reasoning item opens a new assistant output: it replaces the value and closes the open tool-call merge, so the calls after it carry the new chain of thought in their own message.
+- The replay stays limited to the `deepseek*` family — `reasoning_content` keeps its `omitempty` tag and the merge flag is reset only when a reasoning item is actually replayed — so every other Chat Completions-routed model (`glm*`, `kimi*`, `mimo*`, `hy*`, `longcat*`) keeps the exact wire shape of earlier releases. An input message without content (an empty `user`/`system`/`developer` item) also no longer splits a merged tool-call message, for any family. The Anthropic Messages route needs no change: one Anthropic turn is already one Chat Completions message.
 
 ### Why
 
-Replaying a field an endpoint never asked for is the only direction that can fail a request. Sending `reasoning_content` to a Chat Completions upstream that has no use for it adds no value, while a stricter endpoint could reject the unknown field; the response direction has no such failure mode and only affects what the client sees.
+The DeepSeek endpoints require the replayed chain of thought on the message that carries the tool calls, and the split-turn shape is not rare: any assistant turn that emits text before its calls produces it, as does this proxy's own Responses stream conversion, which assigns output indices in arrival order — a Chat Completions upstream that streams `reasoning → tool → text → tool` hands the client exactly that order.
 
-### Cost
+### Verification
 
-If a non-DeepSeek Chat Completions model turns out to need the replay (the endpoint enforcing the same "must be passed back" rule), that model keeps failing until its prefix is added to `reasoningReplayFamilies` in `internal/adapter/chatcompletions/request.go` — a one-line change plus a test.
+- `internal/adapter/chatcompletions/request_test.go` covers a turn that holds text and tool calls in both arrival orders, a text message between two calls, the turn boundaries, a mid-turn reasoning item, and the unchanged tool-call merge shape for a non-replay model. The new tests fail against the v0.1.16 code.
+- `go test ./...`, `go test -tags debug ./...`, `go vet ./...` and `gofmt -l .` are clean, and CI builds the six release targets.
+- Residual risk: no credentialed end-to-end run was possible, so upstream acceptance of the replayed `reasoning_content` on the tool-call message is unconfirmed. What is pinned is the conversion defect — before this change the replay could not reach the message the upstream validates.
 
 ### Upgrade Notes
 
 - Update from this fork's plugin-store source (or replace the plugin binary) and reload CLIProxyAPI.
-- DeepSeek-routed models behave exactly as in v0.1.15 apart from the split-turn replay fix above. Every other Chat Completions-routed model behaves as it did before v0.1.15 for the request direction, while still surfacing whatever reasoning the upstream streams.
-- The Messages and Responses routes are untouched, as are the v0.1.14 tool-call id normalization and the v0.1.13 verbatim error reporting.
+- DeepSeek-routed models behave as in v0.1.16 apart from the split-turn replay fix above.
+- Every other Chat Completions-routed model is unchanged for the request direction, while still surfacing whatever reasoning the upstream streams. The Messages and Responses routes are untouched.
 
-**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.15...v0.1.16
+**Full Changelog**: https://github.com/xspeed1989/opencode-go-cliproxyapi/compare/v0.1.16...v0.1.17
