@@ -42,11 +42,18 @@ type fakeCaller struct {
 	calls     []capturedCall
 	responder func(method string, payload []byte) ([]byte, error)
 	authFiles map[string]struct{}
+	// noRecordPayloads stops call retention. The zero value records every
+	// call, which the tests rely on; benchmarks set it because retaining each
+	// multi-MiB request body across iterations would distort GC and memory
+	// measurement. Lifecycle bookkeeping (auth list/save) still runs.
+	noRecordPayloads bool
 }
 
 func (f *fakeCaller) call(method string, payload []byte) ([]byte, error) {
 	f.mu.Lock()
-	f.calls = append(f.calls, capturedCall{method: method, payload: payload})
+	if !f.noRecordPayloads {
+		f.calls = append(f.calls, capturedCall{method: method, payload: payload})
+	}
 	f.mu.Unlock()
 	var raw []byte
 	var err error

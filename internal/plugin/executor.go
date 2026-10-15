@@ -92,12 +92,13 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	if res == nil {
 		return failEnv, nil
 	}
-	sessionID, eErr := resolveOpenCodeSessionID(req)
+	source := shared.NewSourceRequest(req.SourceFormat, req.OriginalRequest)
+	sessionID, eErr := resolveOpenCodeSessionIDFrom(req, source)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
 	debugTrace("executor session mode=%s source_format=%s x_opencode_session=%s fallback=%t", "non-stream", req.SourceFormat, sessionID, sessionID == emptyOpenCodeSessionID)
-	upstreamBody, eErr := buildUpstreamRequest(res.rec.Protocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking)
+	upstreamBody, eErr := buildUpstreamRequestFrom(res.rec.Protocol, res.rec.UpstreamID, source, res.rec.Thinking)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
@@ -132,14 +133,25 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: converted, Headers: resp.Headers}), nil
 }
 
+// buildUpstreamRequest translates a raw request body for the selected route.
+// It exists for callers that do not own a shared SourceRequest; the execution
+// paths use buildUpstreamRequestFrom so one decode serves both session
+// derivation and conversion.
 func buildUpstreamRequest(route catalog.Route, upstreamModel, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	return buildUpstreamRequestFrom(route, upstreamModel, shared.NewSourceRequest(sourceFormat, sourceBody), ts)
+}
+
+// buildUpstreamRequestFrom translates the request for the selected route from
+// an already-owned SourceRequest, so the typed source representation decoded
+// for session derivation is reused here instead of being parsed again.
+func buildUpstreamRequestFrom(route catalog.Route, upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	switch route {
 	case catalog.RouteChatCompletions:
-		return chatcompletions.BuildRequest(upstreamModel, sourceFormat, sourceBody, ts)
+		return chatcompletions.BuildRequestFrom(upstreamModel, source, ts)
 	case catalog.RouteMessages:
-		return messages.BuildRequest(upstreamModel, sourceFormat, sourceBody, ts)
+		return messages.BuildRequestFrom(upstreamModel, source, ts)
 	case catalog.RouteResponses:
-		return responses.BuildRequest(upstreamModel, sourceFormat, sourceBody, ts)
+		return responses.BuildRequestFrom(upstreamModel, source, ts)
 	}
 	return nil, errclass.Translation("unsupported route")
 }
@@ -193,30 +205,49 @@ func readStreamErrorBody(bridge *HostBridge, upstreamStreamID string) []byte {
 	return body
 }
 
+// sessionHeaderNames is the documented inbound session-identity header
+// precedence (FR-012/AC-H).
+var sessionHeaderNames = []string{
+	"X-Session-Affinity",
+	"X-Opencode-Session",
+	"X-Session-Id",
+	"X-Claude-Code-Session-Id",
+	"Session-Id",
+}
+
 // resolveOpenCodeSessionID applies the FR-012/AC-H precedence: CPA's canonical
 // identity, an explicit inbound session header, then the existing content hash.
 func resolveOpenCodeSessionID(req executorRequest) (string, *errclass.Error) {
+	return resolveOpenCodeSessionIDFrom(req, shared.NewSourceRequest(req.SourceFormat, req.OriginalRequest))
+}
+
+// resolveOpenCodeSessionIDFrom applies the same precedence as
+// resolveOpenCodeSessionID but against a shared SourceRequest. Canonical
+// metadata and recognized session headers short-circuit before the content
+// digest, so the fallback decode only runs when neither is present.
+func resolveOpenCodeSessionIDFrom(req executorRequest, source *shared.SourceRequest) (string, *errclass.Error) {
 	if sid, ok := req.Metadata["canonical_session_id"].(string); ok && sid != "" {
 		return sid, nil
 	}
-	for _, name := range []string{
-		"X-Session-Affinity",
-		"X-Opencode-Session",
-		"X-Session-Id",
-		"X-Claude-Code-Session-Id",
-		"Session-Id",
-	} {
+	for _, name := range sessionHeaderNames {
 		if sid := req.Headers.Get(name); sid != "" {
 			return sid, nil
 		}
 	}
-	return deriveOpenCodeSessionID(req.SourceFormat, req.OriginalRequest)
+	return deriveOpenCodeSessionIDFrom(source)
 }
 
 // deriveOpenCodeSessionID hashes the model-visible content of the initial user
 // turn before translation (FR-012/AC-H). Metadata is excluded;
 // valid requests without a user turn use the fixed empty-input digest.
 func deriveOpenCodeSessionID(sourceFormat string, originalRequest []byte) (string, *errclass.Error) {
+	return deriveOpenCodeSessionIDFrom(shared.NewSourceRequest(sourceFormat, originalRequest))
+}
+
+// deriveOpenCodeSessionIDFrom derives the content digest from a shared
+// SourceRequest, reusing whatever typed representation a caller already
+// decoded and caching the one it needs so later conversion re-parses nothing.
+func deriveOpenCodeSessionIDFrom(source *shared.SourceRequest) (string, *errclass.Error) {
 	var content strings.Builder
 	appendParts := func(raw json.RawMessage, target string) *errclass.Error {
 		parts, eErr := shared.DecodeStringOrParts(raw, target)
@@ -233,11 +264,11 @@ func deriveOpenCodeSessionID(sourceFormat string, originalRequest []byte) (strin
 		return nil
 	}
 
-	switch sourceFormat {
+	switch source.Format() {
 	case "openai":
-		var req shared.ChatCompletionsRequest
-		if err := json.Unmarshal(originalRequest, &req); err != nil {
-			return "", errclass.Translation("malformed openai request JSON: " + err.Error())
+		req, eErr := source.Chat()
+		if eErr != nil {
+			return "", eErr
 		}
 		started := false
 		for _, msg := range req.Messages {
@@ -257,7 +288,7 @@ func deriveOpenCodeSessionID(sourceFormat string, originalRequest []byte) (strin
 			}
 		}
 	case "claude":
-		req, eErr := shared.DecodeClaudeMessages(originalRequest)
+		req, eErr := source.Claude()
 		if eErr != nil {
 			return "", eErr
 		}
@@ -290,11 +321,7 @@ func deriveOpenCodeSessionID(sourceFormat string, originalRequest []byte) (strin
 			}
 		}
 	case "openai-response":
-		var req shared.ResponsesRequest
-		if err := json.Unmarshal(originalRequest, &req); err != nil {
-			return "", errclass.Translation("malformed openai-response request JSON: " + err.Error())
-		}
-		items, eErr := req.DecodeInputItems()
+		items, eErr := source.ResponseItems()
 		if eErr != nil {
 			return "", eErr
 		}
@@ -314,7 +341,7 @@ func deriveOpenCodeSessionID(sourceFormat string, originalRequest []byte) (strin
 			}
 		}
 	default:
-		return "", shared.UnsupportedFormat(sourceFormat, "OpenCode Go session derivation")
+		return "", shared.UnsupportedFormat(source.Format(), "OpenCode Go session derivation")
 	}
 
 	digest := sha256.Sum256([]byte(content.String()))
@@ -391,12 +418,13 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	if res == nil {
 		return failEnv, nil
 	}
-	sessionID, eErr := resolveOpenCodeSessionID(req)
+	source := shared.NewSourceRequest(req.SourceFormat, req.OriginalRequest)
+	sessionID, eErr := resolveOpenCodeSessionIDFrom(req, source)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
 	debugTrace("executor session mode=%s source_format=%s x_opencode_session=%s fallback=%t", "stream", req.SourceFormat, sessionID, sessionID == emptyOpenCodeSessionID)
-	upstreamBody, eErr := buildUpstreamRequest(res.rec.Protocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking)
+	upstreamBody, eErr := buildUpstreamRequestFrom(res.rec.Protocol, res.rec.UpstreamID, source, res.rec.Thinking)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}

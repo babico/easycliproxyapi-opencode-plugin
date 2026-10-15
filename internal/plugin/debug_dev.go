@@ -3,8 +3,6 @@
 package plugin
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,23 +10,13 @@ import (
 	"time"
 )
 
+// debugBodyMeta records constant-time metadata about a request body without
+// parsing or inspecting it: the byte length plus an explicit "unchecked"
+// JSON marker. The request path is hot, so neither a generic json.Unmarshal
+// nor a full-body json.Valid scan is acceptable here, and the body itself may
+// carry prompts or credentials, so no bytes are ever echoed.
 func debugBodyMeta(body []byte) string {
-	if len(body) == 0 {
-		return "len=0 json=false first=- last=-"
-	}
-	var value any
-	if err := json.Unmarshal(body, &value); err != nil {
-		var syntaxErr *json.SyntaxError
-		if errors.As(err, &syntaxErr) {
-			offset := int(syntaxErr.Offset)
-			if offset > 0 && offset <= len(body) {
-				return fmt.Sprintf("len=%d json=false error_offset=%d error_byte=%q first=%q last=%q", len(body), offset, body[offset-1], body[0], body[len(body)-1])
-			}
-			return fmt.Sprintf("len=%d json=false error_offset=%d first=%q last=%q", len(body), offset, body[0], body[len(body)-1])
-		}
-		return fmt.Sprintf("len=%d json=false error=%T first=%q last=%q", len(body), err, body[0], body[len(body)-1])
-	}
-	return fmt.Sprintf("len=%d json=true first=%q last=%q", len(body), body[0], body[len(body)-1])
+	return fmt.Sprintf("len=%d json=unchecked", len(body))
 }
 
 var debugMu sync.Mutex

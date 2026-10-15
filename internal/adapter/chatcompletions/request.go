@@ -35,15 +35,23 @@ func AuthHeaders(key string) http.Header {
 // conversion only when no explicit effort is provided. Unknown formats are
 // ClassUnsupported; malformed input is ClassTranslation.
 func BuildRequest(upstreamModel, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	switch sourceFormat {
+	return BuildRequestFrom(upstreamModel, shared.NewSourceRequest(sourceFormat, sourceBody), ts)
+}
+
+// BuildRequestFrom is BuildRequest's entry point for callers that already own
+// a lazy SourceRequest. The typed source representation decodes at most once
+// per SourceRequest, so the executor can share the session-derivation decode
+// with this conversion. Native "openai" passthrough keeps using the raw body.
+func BuildRequestFrom(upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	switch source.Format() {
 	case "openai":
-		return buildOpenAIRequest(upstreamModel, sourceBody)
+		return buildOpenAIRequest(upstreamModel, source.Raw())
 	case "claude":
-		return claudeToChat(upstreamModel, sourceBody, ts)
+		return claudeToChat(upstreamModel, source, ts)
 	case "openai-response":
-		return responsesToChat(upstreamModel, sourceBody, ts)
+		return responsesToChat(upstreamModel, source, ts)
 	default:
-		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
+		return nil, shared.UnsupportedFormat(source.Format(), EndpointPath)
 	}
 }
 
@@ -167,8 +175,8 @@ type claudeBlock = map[string]any
 // budget maps to a reasoning_effort through the fixed host table
 // (thinking.EffortFromBudget). Decoding is owned entirely by the shared
 // Claude-request kernel; only target-shape rendering stays local.
-func claudeToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	src, eErr := shared.DecodeClaudeMessages(body)
+func claudeToChat(upstreamModel string, source *shared.SourceRequest, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Claude()
 	if eErr != nil {
 		return nil, eErr
 	}
@@ -390,10 +398,10 @@ func reasoningPlainText(item shared.RespItem) string {
 // same turn: the upstream requires its chain of thought back once tools are
 // in play, and dropping it silently degrades the tool loop instead of
 // failing loudly (FR-005).
-func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	var src shared.ResponsesRequest
-	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, errclass.Translation("malformed openai-response request JSON: " + err.Error())
+func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Responses()
+	if eErr != nil {
+		return nil, eErr
 	}
 	out := &ccRequest{
 		Model:             upstreamModel,
@@ -425,7 +433,7 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 	}
 	addSystem(instr)
 
-	items, eErr := src.DecodeInputItems()
+	items, eErr := source.ResponseItems()
 	if eErr != nil {
 		return nil, eErr
 	}

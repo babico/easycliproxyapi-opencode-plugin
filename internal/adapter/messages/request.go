@@ -53,15 +53,23 @@ type messagesRequest struct {
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation. Errors are descriptive and redacted — no silent loss.
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	switch sourceFormat {
+	return BuildRequestFrom(upstreamModel, shared.NewSourceRequest(sourceFormat, sourceBody), ts)
+}
+
+// BuildRequestFrom is BuildRequest's entry point for callers that already own
+// a lazy SourceRequest. The typed source representation decodes at most once
+// per SourceRequest, so the executor can share the session-derivation decode
+// with this conversion. Native "claude" passthrough keeps using the raw body.
+func BuildRequestFrom(upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	switch source.Format() {
 	case "claude":
-		return shared.RewriteModelID(upstreamModel, sourceBody, "claude")
+		return shared.RewriteModelID(upstreamModel, source.Raw(), "claude")
 	case "openai":
-		return fromChatCompletions(upstreamModel, sourceBody, ts)
+		return fromChatCompletions(upstreamModel, source, ts)
 	case "openai-response":
-		return fromResponses(upstreamModel, sourceBody, ts)
+		return fromResponses(upstreamModel, source, ts)
 	default:
-		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
+		return nil, shared.UnsupportedFormat(source.Format(), EndpointPath)
 	}
 }
 
@@ -173,10 +181,10 @@ func finalize(req *messagesRequest, system []string, effort string, _ *pluginapi
 // Explicit omission policy (FR-005): fields with no Messages equivalent
 // (logprobs, frequency_penalty, n, ...) are omitted by struct selection;
 // everything representable is mapped or rejected descriptively.
-func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	var src shared.ChatCompletionsRequest
-	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, errclass.Translation("malformed openai request JSON: " + err.Error())
+func fromChatCompletions(upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Chat()
+	if eErr != nil {
+		return nil, eErr
 	}
 	// The shared kernel owns the FR-005 defaulting policy: a positive
 	// max_tokens (or max_completion_tokens fallback) passes through;
@@ -285,10 +293,10 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 // map like Chat Completions messages, function_call/function_call_output
 // items map to tool_use/tool_result blocks, reasoning summaries are kept
 // as best-effort thinking blocks (signatures unavailable upstream).
-func fromResponses(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	var src shared.ResponsesRequest
-	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, errclass.Translation("malformed openai-response request JSON: " + err.Error())
+func fromResponses(upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Responses()
+	if eErr != nil {
+		return nil, eErr
 	}
 	// Same shared kernel policy as the Chat Completions leg (FR-005).
 	maxTokens := int64(0)
@@ -313,7 +321,7 @@ func fromResponses(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupp
 	}
 
 	var b msgBuilder
-	items, eErr := src.DecodeInputItems()
+	items, eErr := source.ResponseItems()
 	if eErr != nil {
 		return nil, eErr
 	}

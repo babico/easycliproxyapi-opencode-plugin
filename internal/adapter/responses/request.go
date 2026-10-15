@@ -38,15 +38,24 @@ var EndpointPath = catalog.RouteResponses.EndpointPath()
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation; messages are descriptive and redacted.
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	switch sourceFormat {
+	return BuildRequestFrom(upstreamModel, shared.NewSourceRequest(sourceFormat, sourceBody), ts)
+}
+
+// BuildRequestFrom is BuildRequest's entry point for callers that already own
+// a lazy SourceRequest. The typed source representation decodes at most once
+// per SourceRequest, so the executor can share the session-derivation decode
+// with this conversion. Native "openai-response" passthrough keeps using the
+// raw body so input shapes this adapter cannot model are preserved verbatim.
+func BuildRequestFrom(upstreamModel string, source *shared.SourceRequest, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	switch source.Format() {
 	case "openai-response":
-		return rewritePassthrough(upstreamModel, sourceBody)
+		return rewritePassthrough(upstreamModel, source.Raw())
 	case "openai":
-		return fromChatCompletions(upstreamModel, sourceBody, ts)
+		return fromChatCompletions(upstreamModel, source, ts)
 	case "claude":
-		return fromClaudeMessages(upstreamModel, sourceBody, ts)
+		return fromClaudeMessages(upstreamModel, source, ts)
 	default:
-		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
+		return nil, shared.UnsupportedFormat(source.Format(), EndpointPath)
 	}
 }
 
@@ -236,10 +245,10 @@ func contentParts(raw json.RawMessage, role string) ([]map[string]any, *errclass
 //
 // ts is accepted for the executor's uniform adapter fan-out and is
 // intentionally ignored here: declared levels pass through untouched.
-func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	var src shared.ChatCompletionsRequest
-	if err := json.Unmarshal(body, &src); err != nil {
-		return nil, errclass.Translation("malformed openai request JSON: " + err.Error())
+func fromChatCompletions(upstreamModel string, source *shared.SourceRequest, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Chat()
+	if eErr != nil {
+		return nil, eErr
 	}
 	req := &responsesEnvelope{
 		Model:             upstreamModel,
@@ -365,8 +374,8 @@ func fromChatCompletions(upstreamModel string, body []byte, _ *pluginapi.Thinkin
 // silently lost (FR-005). The tool_result is_error flag has no Responses
 // field and is preserved as an "[error] " marker in the output text rather
 // than lost silently.
-func fromClaudeMessages(upstreamModel string, body []byte, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
-	src, eErr := shared.DecodeClaudeMessages(body)
+func fromClaudeMessages(upstreamModel string, source *shared.SourceRequest, _ *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+	src, eErr := source.Claude()
 	if eErr != nil {
 		return nil, eErr
 	}
