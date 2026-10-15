@@ -429,14 +429,25 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 	if eErr != nil {
 		return nil, eErr
 	}
-	// pendingReasoning carries the most recent reasoning item into the
-	// assistant message of its own turn: Responses histories place it before
-	// the message/function_call it belongs to. A user turn in between means
-	// the reasoning had no assistant message to attach to, so it is dropped
-	// instead of leaking into a later turn. Only the families whose endpoints
-	// require the chain of thought back ever get it attached.
+	// turnReasoning carries the replayed chain of thought of the current
+	// assistant turn: Responses histories place the reasoning item before the
+	// message/function_call items it belongs to. One turn can span several Chat
+	// Completions messages — one per assistant text message, plus the tool-call
+	// message that carries the calls — and the upstream validates the messages
+	// that carry tool calls, so every assistant message of the turn gets the
+	// replayed reasoning. A turn boundary — a user, system or developer message,
+	// or the tool result that closes the turn — drops it instead of leaking it
+	// into a later turn. Only the families whose endpoints require the chain of
+	// thought back ever get it attached.
 	replayReasoning := carriesReasoningReplay(upstreamModel)
-	pendingReasoning := ""
+	turnReasoning := ""
+	// mergeToolCalls records whether the trailing tool-call message may absorb
+	// the calls that follow it: a fresh reasoning item opens a new assistant
+	// output, whose calls carry the new chain of thought in their own message.
+	// Without a replayed reasoning item the merge rule stays the one of earlier
+	// releases — a trailing assistant message without content absorbs the calls
+	// that follow it.
+	mergeToolCalls := false
 	for _, item := range items {
 		switch item.Type {
 		case "message":
@@ -446,6 +457,8 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 			}
 			switch item.Role {
 			case "system", "developer":
+				// A system/developer message starts a new turn.
+				turnReasoning = ""
 				// Flatten to text; images have no system-message
 				// equivalent and are rejected descriptively (FR-005).
 				text := ""
@@ -465,14 +478,13 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 			case "user", "assistant":
 				if content != nil {
 					msg := ccMessage{Role: item.Role, Content: content}
-					if item.Role == "assistant" && pendingReasoning != "" {
-						msg.ReasoningContent = pendingReasoning
-						pendingReasoning = ""
+					if item.Role == "assistant" {
+						msg.ReasoningContent = turnReasoning
 					}
 					out.Messages = append(out.Messages, msg)
 				}
 				if item.Role == "user" {
-					pendingReasoning = ""
+					turnReasoning = ""
 				}
 			default:
 				return nil, shared.ValidateRole(item.Role, EndpointPath)
@@ -482,31 +494,32 @@ func responsesToChat(upstreamModel string, body []byte, _ *pluginapi.ThinkingSup
 			tc.Function.Name = item.Name
 			tc.Function.Arguments = shared.DefaultArgs(item.Arguments)
 			// Merge consecutive function_call items into one
-			// assistant message so multi-call turns round-trip.
+			// assistant message so multi-call turns round-trip. A call that
+			// follows a fresh reasoning item belongs to that new output
+			// instead of extending the tool-call message before it.
 			if n := len(out.Messages); n > 0 {
 				last := &out.Messages[n-1]
-				if last.Role == "assistant" && last.Content == nil {
-					if last.ReasoningContent == "" && pendingReasoning != "" {
-						last.ReasoningContent = pendingReasoning
-						pendingReasoning = ""
-					}
+				if mergeToolCalls && last.Role == "assistant" && last.Content == nil {
 					last.ToolCalls = append(last.ToolCalls, tc)
 					continue
 				}
 			}
-			msg := ccMessage{Role: "assistant", ToolCalls: []shared.CCToolCall{tc}}
-			if pendingReasoning != "" {
-				msg.ReasoningContent = pendingReasoning
-				pendingReasoning = ""
-			}
-			out.Messages = append(out.Messages, msg)
+			out.Messages = append(out.Messages, ccMessage{
+				Role: "assistant", ToolCalls: []shared.CCToolCall{tc}, ReasoningContent: turnReasoning,
+			})
+			mergeToolCalls = true
 		case "function_call_output":
+			// The tool result closes the assistant turn the replayed
+			// reasoning belonged to.
+			turnReasoning = ""
 			out.Messages = append(out.Messages, ccMessage{
 				Role: "tool", Content: item.Output, ToolCallID: item.CallID,
 			})
 		case "reasoning":
 			if replayReasoning {
-				pendingReasoning = reasoningPlainText(item)
+				// A fresh reasoning item opens a new assistant output.
+				turnReasoning = reasoningPlainText(item)
+				mergeToolCalls = false
 			}
 		default:
 			return nil, shared.UnsupportedInputItemType(item.Type)

@@ -89,7 +89,7 @@ The upstreams this plugin fronts require their chain of thought back once `tools
 | Responses passthrough | Verbatim both ways (native `reasoning` items, plaintext `reasoning_text`) |
 | Chat Completions passthrough | Verbatim both ways (`reasoning_content`) |
 | Chat Completions upstream → Responses client | `reasoning_content` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions; applies to every model that streams the field |
-| Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on the assistant message of their own turn — only for the `deepseek*` family, whose endpoints require the replay |
+| Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on every assistant message of their own turn — the text message and the tool-call message a turn may be split into — only for the `deepseek*` family, whose endpoints require the replay |
 | Anthropic `thinking` blocks → Chat Completions upstream | Same `deepseek*`-only rule; `redacted_thinking` stays omitted (encrypted metadata) |
 | Responses upstream → Anthropic client | Not carried: the upstream has no Anthropic `signature` to send |
 
