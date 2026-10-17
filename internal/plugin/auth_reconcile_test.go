@@ -3,7 +3,9 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,6 +256,32 @@ func (h *authHost) seed(t *testing.T, name string, raw map[string]any, disabled 
 	return record
 }
 
+// simulateStatePersist mimics the host's auth filestore: an auth-state change
+// rewrites the auth file from the credential held in memory. The one exception
+// is a disabled credential whose file is gone — the host refuses to recreate
+// it. That exception is exactly what makes disable-then-unlink durable, and
+// what a bare unlink did not have (the live host rewrote the file and kept
+// serving the dead key).
+func (h *authHost) simulateStatePersist(t *testing.T) {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, record := range h.records {
+		if record.runtimeDisabled {
+			if _, err := os.Stat(record.path); errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+		}
+		data, err := json.Marshal(record.raw)
+		if err != nil {
+			t.Fatalf("encode record: %v", err)
+		}
+		if err := os.WriteFile(record.path, data, 0o600); err != nil {
+			t.Fatalf("persist record: %v", err)
+		}
+	}
+}
+
 func (h *authHost) savedAuths() []savedAuth {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -330,8 +358,14 @@ func TestReconcileRemovesCredentialDroppedFromConfig(t *testing.T) {
 	}
 
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	if got := len(h.savedAuths()); got != 0 {
-		t.Fatalf("removal wrote %d record(s), want a plain unlink: %+v", got, h.savedAuths())
+	// Deletion disables the record first (that is what stops the host from
+	// rewriting the file from memory) and then unlinks it.
+	saves := h.savedAuths()
+	if len(saves) != 1 || saves[0].name != removedName {
+		t.Fatalf("removal saves = %+v, want one disable of %s", saves, removedName)
+	}
+	if disabled, _ := decodeSaved(t, saves[0])["disabled"].(bool); !disabled {
+		t.Fatalf("record was not disabled before removal: %v", decodeSaved(t, saves[0]))
 	}
 	if h.fileExists(t, removedName) {
 		t.Fatalf("removed credential still on disk: %s", removedName)
@@ -344,8 +378,8 @@ func TestReconcileRemovesCredentialDroppedFromConfig(t *testing.T) {
 	}
 	// Idempotent: the same config must not touch anything again.
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	if got := len(h.savedAuths()); got != 0 {
-		t.Fatalf("repeat reconfigure wrote %d record(s)", got)
+	if got := len(h.savedAuths()); got != 1 {
+		t.Fatalf("repeat reconfigure wrote %d record(s), want 1", got)
 	}
 	h.mu.Lock()
 	remaining := len(h.records)
@@ -411,8 +445,8 @@ func TestReconcileRepairsPhysicalRuntimeDisagreement(t *testing.T) {
 	registerReconciled(t, h, reconcileYAML(enabledKey, disabledKey))
 
 	saves := h.savedAuths()
-	if len(saves) != 2 {
-		t.Fatalf("repair saves = %d, want 2 (the two configured keys): %+v", len(saves), saves)
+	if len(saves) != 3 {
+		t.Fatalf("repair saves = %d, want 3 (two enables + the disable before removal): %+v", len(saves), saves)
 	}
 	byName := map[string]map[string]any{}
 	for _, saved := range saves {
@@ -450,8 +484,9 @@ func TestReconcileDefersWithoutRuntimeIndex(t *testing.T) {
 	// The host attaches its auth manager and applies the config again.
 	h.diskOnly = false
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	if got := len(h.savedAuths()); got != 0 {
-		t.Fatalf("indexed reconfigure wrote %d record(s), want a plain unlink", got)
+	saves := h.savedAuths()
+	if len(saves) != 1 || saves[0].name != authRecordID(removedKey)+".json" {
+		t.Fatalf("indexed reconfigure saves = %+v, want the disable of the removed key", saves)
 	}
 	if h.fileExists(t, authRecordID(removedKey)+".json") {
 		t.Fatalf("deferred record was never removed after the indexed pass")
@@ -662,6 +697,41 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 	})
 }
 
+// TestRemovalSurvivesHostStatePersist pins why deletion disables the record
+// before unlinking it: the host rewrites auth files from the credential it
+// holds in memory whenever that credential changes state, so a bare unlink came
+// back — on a live host the resurrected credential then answered 401. A
+// disabled credential whose file is gone is not rewritten.
+func TestRemovalSurvivesHostStatePersist(t *testing.T) {
+	h := newAuthHost(t)
+	removedKey, keepKey := "sk-reconcile-resurrect", "sk-reconcile-resurrect-keep"
+	h.seedManaged(t, removedKey, false, nil)
+	h.seedManaged(t, keepKey, false, nil)
+	registerReconciled(t, h, reconcileYAML(keepKey))
+	if h.fileExists(t, authRecordID(removedKey)+".json") {
+		t.Fatalf("credential was not removed")
+	}
+
+	h.simulateStatePersist(t)
+	if h.fileExists(t, authRecordID(removedKey)+".json") {
+		t.Fatalf("the host rewrote a removed credential from memory")
+	}
+	// Control: the simulation does rewrite a credential that is still enabled.
+	h.mu.Lock()
+	for _, record := range h.records {
+		if record.name == authRecordID(keepKey)+".json" {
+			if err := os.Remove(record.path); err != nil {
+				t.Fatalf("prepare control: %v", err)
+			}
+		}
+	}
+	h.mu.Unlock()
+	h.simulateStatePersist(t)
+	if !h.fileExists(t, authRecordID(keepKey)+".json") {
+		t.Fatalf("control: an enabled credential was not rewritten")
+	}
+}
+
 // TestReconcileRestoresConfiguredKeyWhoseFileVanished pins the delete-then-
 // restore gap: a key put back into the config while the host still lists the
 // unlinked record must end up with a working credential, not a skipped pass.
@@ -757,8 +827,10 @@ func TestReconcileConvergesAfterManagerRestart(t *testing.T) {
 			t.Fatalf("shutdown %d: %v", i, err)
 		}
 	}
-	if got := len(h.savedAuths()); got != 0 {
-		t.Fatalf("converged state still wrote %d record(s)", got)
+	// The first register disables then unlinks the retired record; the second
+	// finds nothing left to do.
+	if got := len(h.savedAuths()); got != 1 {
+		t.Fatalf("converged state wrote %d record(s), want the single disable", got)
 	}
 	if h.fileExists(t, authRecordID(retiredKey)+".json") {
 		t.Fatalf("retired credential survived reconciliation")

@@ -212,7 +212,7 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 			continue
 		}
 		if !configured {
-			if err := removeManagedAuthFile(id, entry.Name, entry.Path); err != nil {
+			if err := m.removeManagedAuthRecord(ctx, id, entry.Name, entry.Path); err != nil {
 				_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not removed: %v",
 					shortAuthID(id), err), nil)
 				continue
@@ -310,53 +310,85 @@ func managedAuthName(name string) bool {
 	return ok && len(suffix) == 64 && isLowerHex(suffix)
 }
 
-// removeManagedAuthFile unlinks one managed auth file and lets the host's
-// auth-directory watcher unregister the credential.
+// removeManagedAuthRecord deletes one unconfigured credential. It is a
+// two-step operation, and both steps matter:
 //
-// The ownership proof the caller obtained came from a host read of that record,
-// so the unlink must be bound to the very file that was proven, not merely to
-// the name it was listed under: the file is first renamed to a non-.json
-// sibling (atomic, and invisible to the host watcher), then the RENAMED file is
-// read and its record must again prove ownership — same type, same canonical
-// id, same api_key digest — before it is deleted. A file that does not prove
-// ownership is renamed back untouched. The rename also closes the window in
-// which a concurrent writer could swap the file between the proof and the
-// unlink: what gets deleted is the inode that was just verified.
-func removeManagedAuthFile(id, name, path string) error {
+//  1. The record is saved with `disabled: true` first, which is what makes the
+//     host hold it as disabled in memory. Without that step the host keeps the
+//     credential enabled and rewrites the file from memory on the next state
+//     change (a 401 marks it unauthorized and persists it), so a bare unlink
+//     resurrects the credential — observed live, along with the 401 that
+//     followed.
+//  2. The file is then unlinked. The host's auth-directory watcher drops the
+//     credential, and its filestore refuses to recreate a disabled credential
+//     whose file is gone, so the deletion sticks.
+//
+// Ownership is verified from the very file that is deleted — read directly, not
+// taken from the host's read — and its identity is re-checked immediately
+// before the unlink, so a file that is not this plugin's record is never
+// disabled, rewritten or removed.
+func (m *Manager) removeManagedAuthRecord(ctx context.Context, id, name, path string) error {
 	name = strings.TrimSpace(name)
 	path = strings.TrimSpace(path)
 	if !managedAuthName(name) || !filepath.IsAbs(path) || filepath.Base(path) != name {
 		return fmt.Errorf("host did not report a usable auth file path")
 	}
-	if info, err := os.Lstat(path); err != nil {
+	raw, before, err := readManagedAuthFile(id, path)
+	if errors.Is(err, errAuthFileGone) {
+		// Nothing left to delete: the unlink already happened, or the file was
+		// removed out of band. The host drops the runtime entry on its own.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	patched, err := setAuthRecordDisabled(raw, true)
+	if err != nil {
+		return fmt.Errorf("undecodable credential JSON")
+	}
+	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: name, JSON: patched}); err != nil {
+		return err
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("inspect auth file failed")
-	} else if !info.Mode().IsRegular() {
-		return fmt.Errorf("auth file is not a regular file")
 	}
-	staged := path + managedAuthStagingSuffix
-	if err := os.Rename(path, staged); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("stage auth file for removal failed")
+	if !os.SameFile(before, after) {
+		return fmt.Errorf("auth file changed while it was being removed")
 	}
-	raw, err := os.ReadFile(staged)
-	if err != nil {
-		_ = os.Rename(staged, path)
-		return fmt.Errorf("read auth file before removal failed")
-	}
-	if _, owned, errInspect := inspectManagedAuthRecord(id, raw); errInspect != nil || !owned {
-		_ = os.Rename(staged, path)
-		return fmt.Errorf("auth file is not plugin-managed")
-	}
-	if err := os.Remove(staged); err != nil {
-		_ = os.Rename(staged, path)
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("unlink auth file failed")
 	}
 	return nil
+}
+
+// errAuthFileGone marks a removal whose target is already absent.
+var errAuthFileGone = errors.New("auth file is gone")
+
+// readManagedAuthFile reads one canonical auth file and proves from its own
+// bytes that it is a record this plugin materialized.
+func readManagedAuthFile(id, path string) ([]byte, os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, errAuthFileGone
+		}
+		return nil, nil, fmt.Errorf("inspect auth file failed")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("auth file is not a regular file")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read auth file failed")
+	}
+	if _, owned, errInspect := inspectManagedAuthRecord(id, raw); errInspect != nil || !owned {
+		return nil, nil, fmt.Errorf("auth file is not plugin-managed")
+	}
+	return raw, info, nil
 }
 
 // managedAuthStagingSuffix names the sibling used while verifying a file for
