@@ -5,7 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -27,14 +31,19 @@ func authRecordID(key string) string {
 // reconcileAuthRecords makes CPA-visible auth files track cfg.APIKeys, the
 // single source of truth for this provider's credentials:
 //
-//   - a configured key without a record is created (enabled);
-//   - a managed record whose key left the config is DISABLED, and re-enabled
-//     when the key returns, so CPA stops scheduling a key the operator already
-//     removed (a stale record used to stay active and 401 every cooldown);
-//   - nothing is deleted: the host ABI has no delete callback, and a disabled
-//     record stays inspectable/enable-able in Management Center;
+//   - a configured key without a record is created (enabled), and a disabled
+//     managed record for a configured key is re-enabled;
+//   - a managed record whose key left the config is DELETED, so CPA stops
+//     scheduling a key the operator already removed (a stale record used to
+//     stay active and answer 401 on every cooldown);
 //   - a record the plugin cannot prove it created (canonical file name, but the
 //     raw api_key does not hash to that name) is never touched.
+//
+// Deletion cannot go through the host ABI — it exposes list/get/save but no
+// delete/disable — so the plugin removes the auth file at the path the host
+// reported and lets CPA's auth-directory watcher unregister the credential.
+// Only a regular file whose name is the canonical managed name and whose raw
+// record proves ownership is ever unlinked.
 //
 // Ownership is proven from the record's raw JSON, which is only readable by
 // runtime auth index. A host that has not attached its auth manager yet lists
@@ -99,11 +108,11 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 	return m.reconcileManagedAuthState(ctx, entries, expected)
 }
 
-// reconcileManagedAuthState brings every indexed managed record to the disabled
-// state its config membership implies. Reads are compared against the PHYSICAL
-// JSON and the runtime flag, so a disk/runtime disagreement is repaired; writes
-// happen only when a state differs, which keeps repeated reconfigures and
-// manager restarts save-free.
+// reconcileManagedAuthState deletes managed records whose key is no longer
+// configured and re-enables configured ones that are disabled. Reads come from
+// the PHYSICAL JSON, so a disk/runtime disagreement is repaired; the enable
+// write happens only when a state differs, which keeps repeated reconfigures
+// and manager restarts save-free.
 func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []pluginapi.HostAuthFileEntry, expected map[string]struct{}) error {
 	deferred := 0
 	for _, entry := range entries {
@@ -119,7 +128,6 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 			continue
 		}
 		_, configured := expected[id]
-		desiredDisabled := !configured
 		if entry.RuntimeOnly {
 			// No backing file: there is no record to patch, and writing one
 			// would materialize a credential nobody configured.
@@ -129,7 +137,10 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		if strings.TrimSpace(entry.AuthIndex) == "" {
 			// Disk-only listing: the file state is visible, the raw JSON (and
 			// with it the ownership proof) is not.
-			if entry.Disabled != desiredDisabled {
+			if entry.Disabled && configured {
+				deferred++
+			}
+			if !configured {
 				deferred++
 			}
 			continue
@@ -153,21 +164,26 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 				shortAuthID(id)), nil)
 			continue
 		}
-		if physicalDisabled == desiredDisabled && entry.Disabled == desiredDisabled {
+		if !configured {
+			if err := removeManagedAuthFile(entry.Name, entry.Path); err != nil {
+				return fmt.Errorf("remove credential %s: %w", shortAuthID(id), err)
+			}
+			_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s removed: no longer listed in configured api-keys",
+				shortAuthID(id)), nil)
 			continue
 		}
-		patched, err := setAuthRecordDisabled(fetched.JSON, desiredDisabled)
+		if !physicalDisabled && !entry.Disabled {
+			continue
+		}
+		patched, err := setAuthRecordDisabled(fetched.JSON, false)
 		if err != nil {
 			return fmt.Errorf("read credential %s: undecodable credential JSON", shortAuthID(id))
 		}
 		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: entry.Name, JSON: patched}); err != nil {
 			return err
 		}
-		action := "enabled: listed in configured api-keys"
-		if desiredDisabled {
-			action = "disabled: no longer listed in configured api-keys"
-		}
-		_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s %s", shortAuthID(id), action), nil)
+		_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s enabled: listed in configured api-keys",
+			shortAuthID(id)), nil)
 	}
 	if deferred > 0 {
 		_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential reconciliation deferred for %d record(s): the host has no runtime credential index yet, the next reconfigure finishes it",
@@ -180,14 +196,10 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 // type must not contradict it; an empty one on a disk-only listing is fine.
 func managedAuthID(entry pluginapi.HostAuthFileEntry) (string, bool) {
 	name := strings.TrimSpace(entry.Name)
-	if !strings.HasSuffix(name, ".json") {
+	if !managedAuthName(name) {
 		return "", false
 	}
 	id := strings.TrimSuffix(name, ".json")
-	suffix, ok := strings.CutPrefix(id, managedAuthPrefix)
-	if !ok || len(suffix) != 64 || !isLowerHex(suffix) {
-		return "", false
-	}
 	if provider := strings.TrimSpace(entry.Provider); provider != "" && provider != ProviderID {
 		return "", false
 	}
@@ -234,6 +246,42 @@ func setAuthRecordDisabled(raw []byte, disabled bool) ([]byte, error) {
 		delete(fields, "disabled")
 	}
 	return json.Marshal(fields)
+}
+
+// managedAuthName reports whether name is a canonical managed auth file name.
+func managedAuthName(name string) bool {
+	if !strings.HasSuffix(name, ".json") {
+		return false
+	}
+	suffix, ok := strings.CutPrefix(strings.TrimSuffix(name, ".json"), managedAuthPrefix)
+	return ok && len(suffix) == 64 && isLowerHex(suffix)
+}
+
+// removeManagedAuthFile unlinks one managed auth file and lets the host's
+// auth-directory watcher unregister the credential. The reported path must be
+// an absolute, non-symlink regular file named exactly like the managed record:
+// the caller has already proven the record's ownership from its raw JSON, and
+// this check keeps a hostile/odd path from pointing the unlink elsewhere.
+func removeManagedAuthFile(name, path string) error {
+	name = strings.TrimSpace(name)
+	path = strings.TrimSpace(path)
+	if !managedAuthName(name) || !filepath.IsAbs(path) || filepath.Base(path) != name {
+		return fmt.Errorf("host did not report a usable auth file path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("inspect auth file failed")
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("auth file is not a regular file")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("unlink auth file failed")
+	}
+	return nil
 }
 
 // shortAuthID is the 12-hex-prefix form used in logs.

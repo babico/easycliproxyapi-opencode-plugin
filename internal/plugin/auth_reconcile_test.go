@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +23,7 @@ import (
 // save -> list) instead of against a names-only stub.
 type authHost struct {
 	mu      sync.Mutex
+	dir     string // auth directory backing the records
 	records []*authHostRecord
 	saves   []savedAuth
 	logs    []string
@@ -38,6 +41,7 @@ type authHost struct {
 
 type authHostRecord struct {
 	name            string
+	path            string
 	index           string
 	raw             map[string]any
 	runtimeDisabled bool
@@ -52,8 +56,29 @@ type savedAuth struct {
 	json []byte
 }
 
-func newAuthHost() *authHost {
-	return &authHost{}
+func newAuthHost(t *testing.T) *authHost {
+	t.Helper()
+	return &authHost{dir: t.TempDir()}
+}
+
+// pathOf is the on-disk location of a seeded/created record.
+func (h *authHost) pathOf(name string) string { return filepath.Join(h.dir, name) }
+
+func (h *authHost) fileExists(t *testing.T, name string) bool {
+	t.Helper()
+	_, err := os.Stat(h.pathOf(name))
+	return err == nil
+}
+
+func writeAuthFile(t *testing.T, path string, raw map[string]any) {
+	t.Helper()
+	data, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("encode auth file: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
 }
 
 func (h *authHost) call(method string, payload []byte) ([]byte, error) {
@@ -64,6 +89,13 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		kept := h.records[:0]
+		for _, record := range h.records {
+			if _, err := os.Stat(record.path); err == nil {
+				kept = append(kept, record)
+			}
+		}
+		h.records = kept
 		files := make([]pluginapi.HostAuthFileEntry, 0, len(h.records))
 		for _, record := range h.records {
 			entry := pluginapi.HostAuthFileEntry{
@@ -74,7 +106,7 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 				Disabled:    record.runtimeDisabled,
 				RuntimeOnly: record.runtimeOnly,
 				Source:      "file",
-				Path:        record.name,
+				Path:        record.path,
 			}
 			if !h.diskOnly {
 				entry.ID = strings.TrimSuffix(record.name, ".json")
@@ -105,7 +137,7 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 				return hostErr("encode_failed", "bad record"), nil
 			}
 			return hostOK(pluginapi.HostAuthGetResponse{
-				AuthIndex: record.index, Name: record.name, Path: record.name, JSON: raw,
+				AuthIndex: record.index, Name: record.name, Path: record.path, JSON: raw,
 			}), nil
 		}
 		return hostErr("auth_not_found", req.AuthIndex), nil
@@ -131,18 +163,27 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 		defer h.mu.Unlock()
 		h.saves = append(h.saves, savedAuth{name: req.Name, json: append([]byte(nil), req.JSON...)})
 		disabled, _ := fields["disabled"].(bool)
+		path := h.pathOf(req.Name)
+		data, errEncode := json.Marshal(fields)
+		if errEncode != nil {
+			return hostErr("encode_failed", "bad record"), nil
+		}
+		if errWrite := os.WriteFile(path, data, 0o600); errWrite != nil {
+			return hostErr("write_failed", "cannot write auth file"), nil
+		}
 		for _, record := range h.records {
 			if record.name != req.Name {
 				continue
 			}
 			record.raw = fields
+			record.path = path
 			record.runtimeDisabled = disabled
-			return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: req.Name}), nil
+			return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: path}), nil
 		}
 		h.records = append(h.records, &authHostRecord{
-			name: req.Name, index: "index-" + req.Name, raw: fields, runtimeDisabled: disabled,
+			name: req.Name, path: path, index: "index-" + req.Name, raw: fields, runtimeDisabled: disabled,
 		})
-		return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: req.Name}), nil
+		return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: path}), nil
 	case pluginabi.MethodHostLog:
 		var req struct {
 			Message string `json:"message"`
@@ -188,8 +229,11 @@ func (h *authHost) seed(t *testing.T, name string, raw map[string]any, disabled 
 	t.Helper()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	path := h.pathOf(name)
+	writeAuthFile(t, path, raw)
 	record := &authHostRecord{
 		name:            name,
+		path:            path,
 		index:           fmt.Sprintf("index-%d", len(h.records)+1),
 		raw:             raw,
 		runtimeDisabled: disabled,
@@ -258,17 +302,15 @@ func decodeSaved(t *testing.T, saved savedAuth) map[string]any {
 	return fields
 }
 
-// TestReconcileDisablesCredentialRemovedFromConfig is the incident: a key that
-// left cfg.APIKeys must stop being schedulable, without touching the records of
-// keys that stayed.
-func TestReconcileDisablesCredentialRemovedFromConfig(t *testing.T) {
-	h := newAuthHost()
+// TestReconcileRemovesCredentialDroppedFromConfig is the incident: a key that
+// left cfg.APIKeys must stop being schedulable, and its record must be gone
+// rather than left behind as a disabled credential.
+func TestReconcileRemovesCredentialDroppedFromConfig(t *testing.T) {
+	h := newAuthHost(t)
 	removeKey, keepKey := "sk-reconcile-remove", "sk-reconcile-keep"
-	h.seedManaged(t, removeKey, false, map[string]any{
-		"note":     "operator metadata",
-		"priority": 7,
-		"nested":   map[string]any{"keep": []any{"a", true}},
-	})
+	removedName := authRecordID(removeKey) + ".json"
+	keptName := authRecordID(keepKey) + ".json"
+	h.seedManaged(t, removeKey, false, nil)
 	h.seedManaged(t, keepKey, false, nil)
 	m := registerReconciled(t, h, reconcileYAML(removeKey, keepKey))
 	if got := len(h.savedAuths()); got != 0 {
@@ -276,33 +318,28 @@ func TestReconcileDisablesCredentialRemovedFromConfig(t *testing.T) {
 	}
 
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	saves := h.savedAuths()
-	if len(saves) != 1 {
-		t.Fatalf("removed-key saves = %d, want 1: %+v", len(saves), saves)
+	if got := len(h.savedAuths()); got != 0 {
+		t.Fatalf("removal wrote %d record(s), want a plain unlink: %+v", got, h.savedAuths())
 	}
-	if want := authRecordID(removeKey) + ".json"; saves[0].name != want {
-		t.Fatalf("disabled record = %q, want %q", saves[0].name, want)
+	if h.fileExists(t, removedName) {
+		t.Fatalf("removed credential still on disk: %s", removedName)
 	}
-	fields := decodeSaved(t, saves[0])
-	if disabled, _ := fields["disabled"].(bool); !disabled {
-		t.Fatalf("removed key not disabled: %v", fields)
+	if !h.fileExists(t, keptName) {
+		t.Fatalf("configured credential was deleted: %s", keptName)
 	}
-	// The patch must preserve everything the plugin does not own.
-	if fields["note"] != "operator metadata" || fields["priority"] != float64(7) {
-		t.Fatalf("metadata lost: %v", fields)
+	if !logsContain(h.logMessages(), "removed: no longer listed in configured api-keys") {
+		t.Fatalf("removal diagnostic missing: %v", h.logMessages())
 	}
-	nested, _ := fields["nested"].(map[string]any)
-	if _, ok := nested["keep"]; !ok {
-		t.Fatalf("nested metadata lost: %v", fields)
-	}
-	if fields["api_key"] != removeKey {
-		t.Fatalf("api key lost or rewritten: %v", fields)
-	}
-
-	// Idempotent: the same config must not write again.
+	// Idempotent: the same config must not touch anything again.
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	if got := len(h.savedAuths()); got != 1 {
-		t.Fatalf("repeat reconfigure saves = %d, want 1", got)
+	if got := len(h.savedAuths()); got != 0 {
+		t.Fatalf("repeat reconfigure wrote %d record(s)", got)
+	}
+	h.mu.Lock()
+	remaining := len(h.records)
+	h.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("records after removal = %d, want 1", remaining)
 	}
 }
 
@@ -310,9 +347,13 @@ func TestReconcileDisablesCredentialRemovedFromConfig(t *testing.T) {
 // the config is authoritative for managed records, so putting the key back
 // makes it schedulable again without operator action.
 func TestReconcileReenablesCredentialReturnedToConfig(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	key := "sk-reconcile-return"
-	h.seedManaged(t, key, true, nil)
+	h.seedManaged(t, key, true, map[string]any{
+		"note":     "operator metadata",
+		"priority": 7,
+		"nested":   map[string]any{"keep": []any{"a", true}},
+	})
 	m := registerReconciled(t, h, reconcileYAML(key))
 	saves := h.savedAuths()
 	if len(saves) != 1 {
@@ -321,6 +362,17 @@ func TestReconcileReenablesCredentialReturnedToConfig(t *testing.T) {
 	fields := decodeSaved(t, saves[0])
 	if _, present := fields["disabled"]; present {
 		t.Fatalf("enabled record still carries a disabled flag: %v", fields)
+	}
+	// The enable patch must preserve everything the plugin does not own.
+	if fields["note"] != "operator metadata" || fields["priority"] != float64(7) {
+		t.Fatalf("metadata lost: %v", fields)
+	}
+	nested, _ := fields["nested"].(map[string]any)
+	if _, ok := nested["keep"]; !ok {
+		t.Fatalf("nested metadata lost: %v", fields)
+	}
+	if fields["api_key"] != key {
+		t.Fatalf("api key lost or rewritten: %v", fields)
 	}
 	reconfigureReconciled(t, m, h, reconcileYAML(key))
 	if got := len(h.savedAuths()); got != 1 {
@@ -331,7 +383,7 @@ func TestReconcileReenablesCredentialReturnedToConfig(t *testing.T) {
 // TestReconcileRepairsPhysicalRuntimeDisagreement makes sure the decision reads
 // the physical JSON as well as the runtime flag, in both directions.
 func TestReconcileRepairsPhysicalRuntimeDisagreement(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	enabledKey := "sk-reconcile-runtime-stale"
 	disabledKey := "sk-reconcile-disk-stale"
 	stoppedKey := "sk-reconcile-stop-runtime-stale"
@@ -340,14 +392,15 @@ func TestReconcileRepairsPhysicalRuntimeDisagreement(t *testing.T) {
 	enabled.runtimeDisabled = true // runtime says disabled, file says enabled
 	disabled := h.seedManaged(t, disabledKey, true, nil)
 	disabled.runtimeDisabled = false // runtime says enabled, file says disabled
+	// Not configured at all: the record must go, regardless of its flags.
 	stopped := h.seedManaged(t, stoppedKey, true, nil)
-	stopped.runtimeDisabled = false // not configured: desired disabled, runtime lags
+	stopped.runtimeDisabled = false
 
 	registerReconciled(t, h, reconcileYAML(enabledKey, disabledKey))
 
 	saves := h.savedAuths()
-	if len(saves) != 3 {
-		t.Fatalf("repair saves = %d, want 3: %+v", len(saves), saves)
+	if len(saves) != 2 {
+		t.Fatalf("repair saves = %d, want 2 (the two configured keys): %+v", len(saves), saves)
 	}
 	byName := map[string]map[string]any{}
 	for _, saved := range saves {
@@ -359,9 +412,8 @@ func TestReconcileRepairsPhysicalRuntimeDisagreement(t *testing.T) {
 			t.Fatalf("configured credential %q not repaired to enabled: %v", key, fields)
 		}
 	}
-	fields := byName[authRecordID(stoppedKey)+".json"]
-	if disabledFlag, _ := fields["disabled"].(bool); !disabledFlag {
-		t.Fatalf("unconfigured credential not repaired to disabled: %v", fields)
+	if h.fileExists(t, authRecordID(stoppedKey)+".json") {
+		t.Fatalf("unconfigured credential was not removed")
 	}
 }
 
@@ -369,7 +421,7 @@ func TestReconcileRepairsPhysicalRuntimeDisagreement(t *testing.T) {
 // that lists from disk has no auth_index, so nothing may be written on a guess;
 // the next reconfigure with indices converges.
 func TestReconcileDefersWithoutRuntimeIndex(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	removedKey, keepKey := "sk-reconcile-defer-removed", "sk-reconcile-defer-keep"
 	h.seedManaged(t, removedKey, false, nil)
 	h.seedManaged(t, keepKey, false, nil)
@@ -386,9 +438,14 @@ func TestReconcileDefersWithoutRuntimeIndex(t *testing.T) {
 	// The host attaches its auth manager and applies the config again.
 	h.diskOnly = false
 	reconfigureReconciled(t, m, h, reconcileYAML(keepKey))
-	saves := h.savedAuths()
-	if len(saves) != 1 || saves[0].name != authRecordID(removedKey)+".json" {
-		t.Fatalf("indexed reconfigure saves = %+v, want the removed key only", saves)
+	if got := len(h.savedAuths()); got != 0 {
+		t.Fatalf("indexed reconfigure wrote %d record(s), want a plain unlink", got)
+	}
+	if h.fileExists(t, authRecordID(removedKey)+".json") {
+		t.Fatalf("deferred record was never removed after the indexed pass")
+	}
+	if !h.fileExists(t, authRecordID(keepKey)+".json") {
+		t.Fatalf("configured record was removed")
 	}
 }
 
@@ -396,7 +453,7 @@ func TestReconcileDefersWithoutRuntimeIndex(t *testing.T) {
 // canonical file name is not permission to overwrite somebody else's record.
 func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 	t.Run("digest mismatch", func(t *testing.T) {
-		h := newAuthHost()
+		h := newAuthHost(t)
 		nameKey, foreignKey := "sk-reconcile-owner", "sk-reconcile-foreign"
 		id := authRecordID(nameKey)
 		h.seed(t, id+".json", map[string]any{
@@ -409,10 +466,13 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if !logsContain(h.logMessages(), "not plugin-managed") {
 			t.Fatalf("ownership diagnostic missing: %v", h.logMessages())
 		}
+		if !h.fileExists(t, id+".json") {
+			t.Fatalf("unowned record was removed")
+		}
 	})
 
 	t.Run("id mismatch", func(t *testing.T) {
-		h := newAuthHost()
+		h := newAuthHost(t)
 		key := "sk-reconcile-id-mismatch"
 		id := authRecordID(key)
 		record := h.seed(t, id+".json", map[string]any{
@@ -432,10 +492,13 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if logsContain(logs, "sk-secret-in-listed-id") {
 			t.Fatalf("untrusted listed id leaked into logs: %v", logs)
 		}
+		if !h.fileExists(t, id+".json") {
+			t.Fatalf("record with a mismatched listed id was removed")
+		}
 	})
 
 	t.Run("runtime only", func(t *testing.T) {
-		h := newAuthHost()
+		h := newAuthHost(t)
 		removedKey, keepKey := "sk-reconcile-runtime-removed", "sk-reconcile-runtime-keep"
 		h.seedManaged(t, removedKey, false, nil)
 		h.seedManaged(t, keepKey, false, nil)
@@ -446,6 +509,9 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if got := len(h.savedAuths()); got != 0 {
 			t.Fatalf("runtime-only credential materialized into a file: %+v", h.savedAuths())
 		}
+		if !h.fileExists(t, authRecordID(removedKey)+".json") {
+			t.Fatalf("runtime-only record's backing file was removed")
+		}
 	})
 }
 
@@ -453,7 +519,7 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 // pretending the pool matches the config.
 func TestReconcileSurfacesFailures(t *testing.T) {
 	t.Run("get failure", func(t *testing.T) {
-		h := newAuthHost()
+		h := newAuthHost(t)
 		key := "sk-reconcile-get-failure"
 		h.seedManaged(t, key, false, nil)
 		h.getErr = true
@@ -476,28 +542,61 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 	})
 
 	t.Run("save failure", func(t *testing.T) {
-		h := newAuthHost()
-		removedKey, keepKey := "sk-reconcile-save-removed", "sk-reconcile-save-keep"
-		h.seedManaged(t, removedKey, false, nil)
-		h.seedManaged(t, keepKey, false, nil)
-		// Start converged, then make the first required write fail.
-		m := registerReconciled(t, h, reconcileYAML(removedKey, keepKey))
+		h := newAuthHost(t)
+		key := "sk-reconcile-save-failure"
+		// A configured record that must be re-enabled makes the save required.
+		h.seedManaged(t, key, true, nil)
 		h.saveErr = true
-		resp, err := m.HandleCall("plugin.reconfigure", lifecycleRequestBody(reconcileYAML(keepKey)))
+		m := NewManager(NewHostBridge(h.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(key)))
 		if err != nil {
-			t.Fatalf("reconfigure: %v", err)
+			t.Fatalf("register: %v", err)
 		}
 		env := decodeEnv(t, resp)
 		if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
 			t.Fatalf("save failure envelope = %+v", env.Error)
 		}
+		if !h.fileExists(t, authRecordID(key)+".json") {
+			t.Fatalf("failed save deleted the credential")
+		}
+	})
+
+	t.Run("delete failure", func(t *testing.T) {
+		h := newAuthHost(t)
+		key := "sk-reconcile-delete-failure"
+		record := h.seedManaged(t, key, false, nil)
+		// Replace the backing file with a directory: the unlink must refuse
+		// rather than remove something that is not the credential file.
+		dirPath := record.path
+		if err := os.Remove(dirPath); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		if err := os.Mkdir(dirPath, 0o700); err != nil {
+			t.Fatalf("prepare dir: %v", err)
+		}
+		m := NewManager(NewHostBridge(h.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML("sk-reconcile-delete-other")))
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		env := decodeEnv(t, resp)
+		if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" ||
+			!strings.Contains(env.Error.Message, "remove credential") {
+			t.Fatalf("delete failure envelope = %+v", env.Error)
+		}
+		if info, errStat := os.Stat(dirPath); errStat != nil || !info.IsDir() {
+			t.Fatalf("non-regular path was disturbed: %v", errStat)
+		}
 	})
 }
 
 // TestReconcileConvergesAfterManagerRestart pins idempotency across a fresh
-// manager: identical state must not produce writes.
+// manager: the retired record is removed once and identical state produces no
+// writes afterwards.
 func TestReconcileConvergesAfterManagerRestart(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	activeKey, retiredKey := "sk-reconcile-restart-active", "sk-reconcile-restart-retired"
 	h.seedManaged(t, activeKey, false, nil)
 	h.seedManaged(t, retiredKey, true, nil)
@@ -516,6 +615,12 @@ func TestReconcileConvergesAfterManagerRestart(t *testing.T) {
 	}
 	if got := len(h.savedAuths()); got != 0 {
 		t.Fatalf("converged state still wrote %d record(s)", got)
+	}
+	if h.fileExists(t, authRecordID(retiredKey)+".json") {
+		t.Fatalf("retired credential survived reconciliation")
+	}
+	if !h.fileExists(t, authRecordID(activeKey)+".json") {
+		t.Fatalf("configured credential disappeared")
 	}
 }
 
@@ -563,15 +668,15 @@ func logsContain(logs []string, want string) bool {
 	return false
 }
 
-// TestReconcileWaitsForOutstandingSave pins the unknown-commit rule: a disable
-// save that timed out keeps running, so the next pass must not read the old
-// state and report success while that write can still land behind it.
+// TestReconcileWaitsForOutstandingSave pins the unknown-commit rule: a save
+// that timed out keeps running, so the next pass must not read the old state
+// and report success while that write can still land behind it.
 func TestReconcileWaitsForOutstandingSave(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	key, keep := "sk-reconcile-slow-save", "sk-reconcile-slow-keep"
-	h.seedManaged(t, key, false, nil)
+	// The key is configured but its record is disabled: pass 1 must re-enable it.
+	h.seedManaged(t, key, true, nil)
 	h.seedManaged(t, keep, false, nil)
-	// Both records already exist, so the only write pass 1 needs is the disable.
 	withKey, err := config.Load([]byte(reconcileYAML(key, keep)))
 	if err != nil {
 		t.Fatalf("load config with key: %v", err)
@@ -601,20 +706,20 @@ func TestReconcileWaitsForOutstandingSave(t *testing.T) {
 	}
 	t.Cleanup(release)
 
-	// Pass 1 wants to disable the key, but the save outlives its deadline.
+	// Pass 1 wants to re-enable the key, but the save outlives its deadline.
 	shortCtx, cancelShort := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancelShort()
-	if err := m.reconcileAuthRecords(shortCtx, withoutKey); err == nil ||
+	if err := m.reconcileAuthRecords(shortCtx, withKey); err == nil ||
 		!strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("outlived save error = %v, want timeout", err)
 	}
 
-	// Pass 2 restores the key. It must not report success while the orphan can
-	// still disable the record: it blocks until the save settles, then repairs.
+	// Pass 2 drops the key. It must not act while the orphaned enable can still
+	// land: it blocks until the save settles, then removes the record.
 	passCtx, cancelPass := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancelPass()
 	done := make(chan error, 1)
-	go func() { done <- m.reconcileAuthRecords(passCtx, withKey) }()
+	go func() { done <- m.reconcileAuthRecords(passCtx, withoutKey) }()
 	select {
 	case err := <-done:
 		t.Fatalf("pass returned before the outstanding save settled: %v", err)
@@ -632,22 +737,11 @@ func TestReconcileWaitsForOutstandingSave(t *testing.T) {
 		t.Fatal("pass did not finish after the outstanding save settled")
 	}
 
-	h.mu.Lock()
-	record := h.records[0]
-	h.mu.Unlock()
-	if disabled, _ := record.raw["disabled"].(bool); disabled {
-		t.Fatalf("record left disabled after the orphan landed: %v", record.raw)
+	if h.fileExists(t, authRecordID(key)+".json") {
+		t.Fatalf("orphaned enable landed after the removal")
 	}
-	saves := h.savedAuths()
-	if len(saves) < 2 {
-		t.Fatalf("saves = %d, want the orphaned disable plus the repairing enable", len(saves))
-	}
-	last := decodeSaved(t, saves[len(saves)-1])
-	if _, present := last["disabled"]; present {
-		t.Fatalf("repair did not enable the record: %v", last)
-	}
-	if saves[len(saves)-1].name != authRecordID(key)+".json" {
-		t.Fatalf("repair wrote %q, want the re-enabled record", saves[len(saves)-1].name)
+	if !h.fileExists(t, authRecordID(keep)+".json") {
+		t.Fatalf("configured record was removed")
 	}
 }
 
@@ -655,7 +749,7 @@ func TestReconcileWaitsForOutstandingSave(t *testing.T) {
 // the orphan does not settle inside the lifecycle deadline, the pass fails
 // instead of claiming the pool matches the config.
 func TestReconcileRefusesWhileSaveUnsettled(t *testing.T) {
-	h := newAuthHost()
+	h := newAuthHost(t)
 	key := "sk-reconcile-stuck-save"
 	h.seedManaged(t, key, false, nil)
 	withKey, err := config.Load([]byte(reconcileYAML(key)))

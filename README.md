@@ -170,12 +170,14 @@ Every value in `api-keys` is materialized as a CPA auth file named `opencode-go-
 | State | Action |
 |---|---|
 | Key in config, no record yet | Record created, enabled |
-| Key in config, record disabled | Record re-enabled (`disabled` removed) |
-| Key removed from config, record enabled | Record disabled (`disabled: true`) |
+| Key in config, record disabled | Record re-enabled (`disabled` removed; all other fields carried over verbatim) |
+| Key removed from config, record present | Record **deleted** — the auth file is unlinked and the host's auth-directory watcher unregisters the credential |
 | Canonical file name, but `api_key` does not hash to it, or `id`/`type` disagree | Left untouched, one `warn` line |
 | Runtime-only record (no backing file) | Left untouched |
 
-Only the `disabled` flag is rewritten; every other field in the record (label, note, priority, nested metadata) is carried over verbatim. Nothing is deleted: a disabled record stays visible and re-enable-able in Management Center. A write happens only when the physical JSON and the runtime flag already disagree with the desired state, so repeated reconfigures and host restarts perform no writes.
+The host ABI has no delete callback (`host.auth.list/get/save` only), so deletion unlinks the file at the path the host reports, after proving from the raw record that the plugin created it. Only an absolute, non-symlink regular file named exactly `opencode-go-key-<64 lowercase hex>.json` is ever removed; if the reported path is unusable the pass fails instead of leaving a silently stale credential. Deletion depends on CPA's auth-directory watcher being enabled (the default); without it the file is gone but the in-memory credential survives until the next reload.
+
+Only the enable path rewrites a record, and it patches only `disabled`; every other field (label, note, priority, nested metadata) is preserved as raw JSON. Writes happen only when the physical JSON or the runtime flag already disagree with the desired state, so repeated reconfigures and host restarts perform no writes.
 
 Two limits are worth knowing:
 
