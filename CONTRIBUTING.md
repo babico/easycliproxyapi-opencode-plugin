@@ -48,3 +48,13 @@ go build -tags debug -buildmode=c-shared -o plugins/windows/amd64/opencode-go-cl
 2. Implement your changes following the code style and testing guidelines above.
 3. Ensure `go test -tags debug ./...` and `go vet ./...` pass cleanly.
 4. Open a pull request against `main` with a clear description of the change and any related issue references.
+
+---
+
+## Release Checklist
+
+1. Bump `pluginVersion` in `internal/plugin/plugin.go`.
+2. Rewrite `RELEASE_NOTES.md` as the release notes for that version — the file is published verbatim as the GitHub release body — and point its compare link at the new tag.
+3. Set `version` in `registry.json` to the same version. The plugin store falls back to this field when its GitHub release lookup fails (anonymous API quota, network, proxy); if it is missing or stale the store cannot show an update badge.
+4. Run `go test ./...`, `go test -tags debug ./...`, `go vet ./...` and `gofmt -l .`.
+5. Commit `chore(release): vX.Y.Z`, push `main`, then create and push the annotated tag. CI builds the six release targets and publishes the GitHub release from `RELEASE_NOTES.md`.

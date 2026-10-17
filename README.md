@@ -210,6 +210,8 @@ Then open Management Center → Plugin Store and install `opencode-go-cliproxyap
 
 The store writes `plugins/<goos>/<goarch>/opencode-go-cliproxyapi_<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
 
+The store resolves each plugin's latest version from the GitHub releases API and caches it per repository for ten minutes, falling back to the `version` field of `registry.json` when that lookup fails. Anonymous GitHub API quota is 60 requests per hour per IP and a single store page load queries every plugin of every enabled registry, so the lookup does fail; that is why `registry.json` carries the current release version. Two consequences for a fresh release: an update can take up to ten minutes to appear, and a row whose version column stays empty got neither the lookup nor the fallback. A plugin installed by hand (not through the store) is also never offered an update while two registries list the same plugin id, because the store cannot verify which source it came from — uninstall it and install it from the `raw.githubusercontent.com` source.
+
 ## Testing
 
 ```powershell
