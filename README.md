@@ -179,7 +179,7 @@ Only the `disabled` flag is rewritten; every other field in the record (label, n
 
 Two limits are worth knowing:
 
-- **Bootstrap has no runtime index.** Until the host attaches its auth manager, `host.auth.list` reads the auth directory and returns neither `id` nor `auth_index`, so the raw record cannot be read and ownership cannot be proven. Creation still happens; a record whose state disagrees with the config is reported as deferred (`opencode-go credential reconciliation deferred for N record(s)`) and the next reconfigure finishes it. A register-only host (no later reconfigure) therefore keeps the old behaviour and never guesses an index.
+- **Bootstrap has no runtime index.** Until the host attaches its auth manager, `host.auth.list` reads the auth directory and returns neither `id` nor `auth_index`, so the raw record cannot be read and ownership cannot be proven. Creation still happens; a record whose state disagrees with the config is reported as deferred (`opencode-go credential reconciliation deferred for N record(s)`). CLIProxyAPI v8 applies the plugin config again once the auth manager is attached, which finishes the work at startup; a host that never reconfigures keeps the old record and the deferral line, and never has an index guessed for it.
 - **GET + SAVE is not a transaction.** If a save fails, registration/reconfigure reports `auth_materialization_failed` instead of claiming the pool matches the config; the next lifecycle pass re-reads the state and converges. A timed-out save may still land afterwards; the desired state is deterministic, so the next pass repairs it.
 
 ## Install via the plugin store (this fork)
