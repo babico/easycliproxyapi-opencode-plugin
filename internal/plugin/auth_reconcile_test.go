@@ -550,6 +550,55 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if h.fileExists(t, record.name+managedAuthStagingSuffix) {
 			t.Fatalf("staging file left behind")
 		}
+		// Nothing may be written for that record before ownership is proven: it
+		// must not have been disabled by the removal attempt. (The configured
+		// key in this config has no record yet, so one creation save is fine.)
+		for _, saved := range h.savedAuths() {
+			if saved.name == record.name {
+				t.Fatalf("removal wrote the unproven record: %s", saved.json)
+			}
+		}
+	})
+
+	t.Run("save failure during removal keeps the record", func(t *testing.T) {
+		h := newAuthHost(t)
+		key, keep := "sk-reconcile-remove-save-failure", "sk-reconcile-remove-save-keep"
+		record := h.seedManaged(t, key, false, nil)
+		// The configured record already exists, so the removal's disable save is
+		// the only write the pass needs — and it is the one that fails.
+		h.seedManaged(t, keep, false, nil)
+		h.saveErr = true
+		m := NewManager(NewHostBridge(h.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(keep)))
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("register rejected: %+v", env.Error)
+		}
+		if !logsContain(h.logMessages(), "not removed: host auth save failed") {
+			t.Fatalf("removal save-failure diagnostic missing: %v", h.logMessages())
+		}
+		// The staged file must be back where the host expects it, with its
+		// original contents.
+		if !h.fileExists(t, record.name) {
+			t.Fatalf("record was lost when the disable save failed")
+		}
+		if h.fileExists(t, record.name+managedAuthStagingSuffix) {
+			t.Fatalf("staging file left behind after a failed save")
+		}
+		onDisk, err := os.ReadFile(record.path)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(onDisk, &fields); err != nil {
+			t.Fatalf("decode back: %v", err)
+		}
+		if _, disabled := fields["disabled"]; disabled || fields["api_key"] != key {
+			t.Fatalf("record was modified by the failed removal: %v", fields)
+		}
 	})
 
 	t.Run("list and read disagree on the path", func(t *testing.T) {
