@@ -1,11 +1,15 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"opencode-go-cliproxyapi/internal/config"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -20,6 +24,9 @@ type authHost struct {
 	records []*authHostRecord
 	saves   []savedAuth
 	logs    []string
+	// saveGate, when non-nil, parks every save callback until it is closed:
+	// it reproduces a save that outlives its deadline.
+	saveGate chan struct{}
 
 	// diskOnly emulates a host that has not attached its auth manager yet:
 	// plain host.auth.list reads the directory and carries no id/auth_index.
@@ -35,6 +42,9 @@ type authHostRecord struct {
 	raw             map[string]any
 	runtimeDisabled bool
 	runtimeOnly     bool
+	// listedID, when non-empty, is what host.auth.list reports instead of the
+	// canonical id (host input the plugin must not trust or echo).
+	listedID string
 }
 
 type savedAuth struct {
@@ -68,6 +78,9 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 			}
 			if !h.diskOnly {
 				entry.ID = strings.TrimSuffix(record.name, ".json")
+				if record.listedID != "" {
+					entry.ID = record.listedID
+				}
 				entry.AuthIndex = record.index
 			}
 			files = append(files, entry)
@@ -97,6 +110,12 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 		}
 		return hostErr("auth_not_found", req.AuthIndex), nil
 	case pluginabi.MethodHostAuthSave:
+		h.mu.Lock()
+		gate := h.saveGate
+		h.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
 		if h.saveErr {
 			return hostErr("auth_save_failed", "disk full"), nil
 		}
@@ -396,12 +415,22 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		h := newAuthHost()
 		key := "sk-reconcile-id-mismatch"
 		id := authRecordID(key)
-		h.seed(t, id+".json", map[string]any{
-			"type": ProviderID, "id": "someone-elses-id", "api_key": key,
+		record := h.seed(t, id+".json", map[string]any{
+			"type": ProviderID, "id": id, "api_key": key,
 		}, false)
+		// The listed id is host input that may have been copied from credential
+		// JSON; it must never reach the log.
+		record.listedID = "sk-secret-in-listed-id"
 		registerReconciled(t, h, reconcileYAML(key))
 		if got := len(h.savedAuths()); got != 0 {
 			t.Fatalf("record with foreign id rewritten: %+v", h.savedAuths())
+		}
+		logs := h.logMessages()
+		if !logsContain(logs, "does not match the canonical file name") {
+			t.Fatalf("identity diagnostic missing: %v", logs)
+		}
+		if logsContain(logs, "sk-secret-in-listed-id") {
+			t.Fatalf("untrusted listed id leaked into logs: %v", logs)
 		}
 	})
 
@@ -532,4 +561,155 @@ func logsContain(logs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestReconcileWaitsForOutstandingSave pins the unknown-commit rule: a disable
+// save that timed out keeps running, so the next pass must not read the old
+// state and report success while that write can still land behind it.
+func TestReconcileWaitsForOutstandingSave(t *testing.T) {
+	h := newAuthHost()
+	key, keep := "sk-reconcile-slow-save", "sk-reconcile-slow-keep"
+	h.seedManaged(t, key, false, nil)
+	h.seedManaged(t, keep, false, nil)
+	// Both records already exist, so the only write pass 1 needs is the disable.
+	withKey, err := config.Load([]byte(reconcileYAML(key, keep)))
+	if err != nil {
+		t.Fatalf("load config with key: %v", err)
+	}
+	withoutKey, err := config.Load([]byte(reconcileYAML(keep)))
+	if err != nil {
+		t.Fatalf("load config without key: %v", err)
+	}
+	bridge := NewHostBridge(h.call)
+	m := NewManager(bridge)
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+
+	gate := make(chan struct{})
+	h.mu.Lock()
+	h.saveGate = gate
+	h.mu.Unlock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		h.mu.Lock()
+		h.saveGate = nil
+		h.mu.Unlock()
+		close(gate)
+	}
+	t.Cleanup(release)
+
+	// Pass 1 wants to disable the key, but the save outlives its deadline.
+	shortCtx, cancelShort := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelShort()
+	if err := m.reconcileAuthRecords(shortCtx, withoutKey); err == nil ||
+		!strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("outlived save error = %v, want timeout", err)
+	}
+
+	// Pass 2 restores the key. It must not report success while the orphan can
+	// still disable the record: it blocks until the save settles, then repairs.
+	passCtx, cancelPass := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelPass()
+	done := make(chan error, 1)
+	go func() { done <- m.reconcileAuthRecords(passCtx, withKey) }()
+	select {
+	case err := <-done:
+		t.Fatalf("pass returned before the outstanding save settled: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Let the orphaned save land, then let pass 2 run to completion.
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pass after settle: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pass did not finish after the outstanding save settled")
+	}
+
+	h.mu.Lock()
+	record := h.records[0]
+	h.mu.Unlock()
+	if disabled, _ := record.raw["disabled"].(bool); disabled {
+		t.Fatalf("record left disabled after the orphan landed: %v", record.raw)
+	}
+	saves := h.savedAuths()
+	if len(saves) < 2 {
+		t.Fatalf("saves = %d, want the orphaned disable plus the repairing enable", len(saves))
+	}
+	last := decodeSaved(t, saves[len(saves)-1])
+	if _, present := last["disabled"]; present {
+		t.Fatalf("repair did not enable the record: %v", last)
+	}
+	if saves[len(saves)-1].name != authRecordID(key)+".json" {
+		t.Fatalf("repair wrote %q, want the re-enabled record", saves[len(saves)-1].name)
+	}
+}
+
+// TestReconcileRefusesWhileSaveUnsettled covers the other half of the rule: if
+// the orphan does not settle inside the lifecycle deadline, the pass fails
+// instead of claiming the pool matches the config.
+func TestReconcileRefusesWhileSaveUnsettled(t *testing.T) {
+	h := newAuthHost()
+	key := "sk-reconcile-stuck-save"
+	h.seedManaged(t, key, false, nil)
+	withKey, err := config.Load([]byte(reconcileYAML(key)))
+	if err != nil {
+		t.Fatalf("load config with key: %v", err)
+	}
+	withoutKey, err := config.Load([]byte("api-keys:\n  - value: sk-reconcile-stuck-other\n"))
+	if err != nil {
+		t.Fatalf("load config without key: %v", err)
+	}
+	m := NewManager(NewHostBridge(h.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+
+	gate := make(chan struct{})
+	h.mu.Lock()
+	h.saveGate = gate
+	h.mu.Unlock()
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		h.mu.Lock()
+		h.saveGate = nil
+		h.mu.Unlock()
+		close(gate)
+	}
+	t.Cleanup(release)
+
+	shortCtx, cancelShort := context.WithTimeout(t.Context(), 40*time.Millisecond)
+	defer cancelShort()
+	if err := m.reconcileAuthRecords(shortCtx, withoutKey); err == nil ||
+		!strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("outlived save error = %v, want timeout", err)
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 60*time.Millisecond)
+	defer cancelWait()
+	if err := m.reconcileAuthRecords(waitCtx, withKey); err == nil ||
+		!strings.Contains(err.Error(), "still in flight") {
+		t.Fatalf("unsettled save error = %v, want in-flight refusal", err)
+	}
+	release()
+}
+
+// TestBridgeAuthListSanitizesFailures keeps the list channel from echoing host
+// error bodies, which can contain credential records.
+func TestBridgeAuthListSanitizesFailures(t *testing.T) {
+	bridge := NewHostBridge(func(string, []byte) ([]byte, error) {
+		return hostErr("auth_unavailable", "auth directory echoed sk-secret-in-error"), nil
+	})
+	if _, err := bridge.AuthList(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "host auth list failed") || strings.Contains(err.Error(), "sk-secret") {
+		t.Fatalf("list failure text = %v", err)
+	}
 }

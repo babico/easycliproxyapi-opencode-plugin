@@ -45,6 +45,12 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 	if m.bridge == nil {
 		return nil
 	}
+	// A timed-out save may still be writing. Reading now could observe the
+	// pre-write state and then report success while the orphan lands behind
+	// us, so wait for outstanding writes to settle (or fail honestly).
+	if err := m.bridge.WaitAuthSaves(ctx); err != nil {
+		return err
+	}
 	entries, err := m.bridge.AuthList(ctx)
 	if err != nil {
 		return fmt.Errorf("list existing auth records: %w", err)
@@ -106,8 +112,10 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 			continue
 		}
 		if listed := strings.TrimSpace(entry.ID); listed != "" && listed != id {
-			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host reports id %q",
-				shortAuthID(id), listed), nil)
+			// The listed id is host input that may have been copied from
+			// credential JSON: never echo it, only the validated digest prefix.
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host id does not match the canonical file name",
+				shortAuthID(id)), nil)
 			continue
 		}
 		_, configured := expected[id]
