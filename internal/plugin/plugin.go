@@ -2,8 +2,6 @@ package plugin
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -311,7 +309,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	debugTrace("lifecycle config_loaded key_count=%d prefix_enabled=%t prefix=%s", len(cfg.APIKeys), cfg.ModelPrefix.Enabled, cfg.ModelPrefix.Value)
 	ctx, cancel := context.WithTimeout(context.Background(), registerRefreshTimeout)
 	defer cancel()
-	if err := m.materializeAuthRecords(ctx, cfg); err != nil {
+	if err := m.reconcileAuthRecords(ctx, cfg); err != nil {
 		return ErrEnvelope("auth_materialization_failed", err.Error()), nil
 	}
 	// A nil *HostBridge must not enter the interface as a typed nil, or
@@ -355,62 +353,6 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 
 	m.startRefreshLoop(cfg, mgr, interval, stop, done)
 	return registrationEnvelope(), nil
-}
-
-// materializeAuthRecords makes CPA-visible auth files idempotently. Existing
-// records are discovered through CPA so their host-managed metadata is never
-// overwritten. The full key digest is non-secret and independent of config
-// ordering. The host ABI has no delete/disable callback, so removed keys remain
-// stale records and are not claimed as removed.
-func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config) error {
-	if m.bridge == nil {
-		return nil
-	}
-	entries, err := m.bridge.AuthList(ctx)
-	if err != nil {
-		return fmt.Errorf("list existing auth records: %w", err)
-	}
-	existing := make(map[string]struct{}, len(entries)*2)
-	for _, entry := range entries {
-		if name := strings.TrimSpace(entry.Name); name != "" {
-			existing[name] = struct{}{}
-		}
-		if id := strings.TrimSpace(entry.ID); id != "" {
-			existing[id] = struct{}{}
-		}
-	}
-	for _, key := range cfg.APIKeys {
-		digest := sha256.Sum256([]byte(key.Value))
-		hash := hex.EncodeToString(digest[:])
-		id := "opencode-go-key-" + hash
-		name := id + ".json"
-		if _, ok := existing[id]; ok {
-			continue
-		}
-		if _, ok := existing[name]; ok {
-			continue
-		}
-		record, err := json.Marshal(struct {
-			Type   string `json:"type"`
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			APIKey string `json:"api_key"`
-		}{
-			Type: "opencode-go", ID: id, Label: "OpenCode Go credential " + hash, APIKey: key.Value,
-		})
-		if err != nil {
-			return fmt.Errorf("build auth record")
-		}
-		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{
-			Name: name, JSON: record,
-		}); err != nil {
-			return err
-		}
-		existing[id] = struct{}{}
-		existing[name] = struct{}{}
-		debugTrace("auth materialized id=%s file=%s", id, name)
-	}
-	return nil
 }
 
 // handleModels implements model.static / model.for_auth (FR-003): the last

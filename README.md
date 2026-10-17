@@ -32,6 +32,7 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
 - **Explainable failures**: a streaming request the upstream refuses before the first byte reports that status plus up to 2 KiB of its error body verbatim, instead of an empty message the host renders as `plugin call failed`.
 - **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
 - **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
+- **Config-authoritative credentials**: `api-keys` is the single source of truth. Every configured key is materialized as a CPA auth record; a key removed from the config has its record **disabled** (not deleted — the plugin ABI has no delete callback) so the scheduler stops offering it, and putting the key back re-enables the record. Records the plugin cannot prove it created are never touched. See [Credential reconciliation](#credential-reconciliation).
 - **OpenCode Go Quota Page**: Management Center includes a separate `OpenCode Go Quota` page. Page load lists credentials without contacting OpenCode; each card is refreshed manually and independently, and quota values do not affect routing or CPA's native quota page.
 
 ## Requirements
@@ -161,6 +162,25 @@ plugins:
 | `request-timeout` | `duration` | `5m` | Upstream HTTP request timeout. Must be positive. |
 | `max-response-bytes` | `int64` | `67108864` (64 MiB) | Maximum non-streaming response body size in bytes. |
 | `allow-http` | `bool` | `false` | When `true`, permits `http://` scheme in `base-url` / `catalog-url` for local testing. |
+
+## Credential reconciliation
+
+Every value in `api-keys` is materialized as a CPA auth file named `opencode-go-key-<sha256(api_key)>.json`, because CPA schedules credentials — not plugin config. Registration and every reconfigure reconcile those records against the config:
+
+| State | Action |
+|---|---|
+| Key in config, no record yet | Record created, enabled |
+| Key in config, record disabled | Record re-enabled (`disabled` removed) |
+| Key removed from config, record enabled | Record disabled (`disabled: true`) |
+| Canonical file name, but `api_key` does not hash to it, or `id`/`type` disagree | Left untouched, one `warn` line |
+| Runtime-only record (no backing file) | Left untouched |
+
+Only the `disabled` flag is rewritten; every other field in the record (label, note, priority, nested metadata) is carried over verbatim. Nothing is deleted: a disabled record stays visible and re-enable-able in Management Center. A write happens only when the physical JSON and the runtime flag already disagree with the desired state, so repeated reconfigures and host restarts perform no writes.
+
+Two limits are worth knowing:
+
+- **Bootstrap has no runtime index.** Until the host attaches its auth manager, `host.auth.list` reads the auth directory and returns neither `id` nor `auth_index`, so the raw record cannot be read and ownership cannot be proven. Creation still happens; a record whose state disagrees with the config is reported as deferred (`opencode-go credential reconciliation deferred for N record(s)`) and the next reconfigure finishes it. A register-only host (no later reconfigure) therefore keeps the old behaviour and never guesses an index.
+- **GET + SAVE is not a transaction.** If a save fails, registration/reconfigure reports `auth_materialization_failed` instead of claiming the pool matches the config; the next lifecycle pass re-reads the state and converges. A timed-out save may still land afterwards; the desired state is deterministic, so the next pass repairs it.
 
 ## Install via the plugin store (this fork)
 

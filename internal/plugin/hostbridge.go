@@ -102,6 +102,34 @@ func (b *HostBridge) AuthList(ctx context.Context) ([]pluginapi.HostAuthFileEntr
 	return resp.Files, nil
 }
 
+// AuthGet reads one credential's physical JSON by its runtime auth index.
+// The index is only available while the host has its auth manager attached; a
+// disk-only listing carries none, so callers must not treat a failure here as
+// proof of absence. Host error text is not trusted and never surfaces: the
+// response body can echo credential JSON.
+func (b *HostBridge) AuthGet(ctx context.Context, authIndex string) (pluginapi.HostAuthGetResponse, error) {
+	payload, err := json.Marshal(pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
+	if err != nil {
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed: invalid request")
+	}
+	raw, err := b.callWithTimeout(ctx, pluginabi.MethodHostAuthGet, payload)
+	if err != nil {
+		if strings.Contains(err.Error(), "timed out") {
+			return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed: timed out")
+		}
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed")
+	}
+	env, err := decodeEnvelope(raw)
+	if err != nil || !env.OK {
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed")
+	}
+	var resp pluginapi.HostAuthGetResponse
+	if len(env.Result) > 0 && json.Unmarshal(env.Result, &resp) != nil {
+		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("host auth get failed: undecodable response body")
+	}
+	return resp, nil
+}
+
 // hostStreamIDReq addresses an existing stream by its ID.
 type hostStreamIDReq struct {
 	StreamID string `json:"stream_id"`
