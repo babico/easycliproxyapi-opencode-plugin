@@ -1,3 +1,14 @@
+## Unreleased
+
+### Fix
+
+- Report why a catalog model was excluded, in the log message itself. Both post-refresh diagnostics (`unsupported models excluded from routable catalog`, `catalog normalization warnings`) used to carry their detail only in `host.log` fields, and the host's `LogFormatter` renders only its own field allowlist (`provider`, `model`, `error`, …) — every other key is dropped. The result on a live host was a line that repeated every refresh cycle with no model name and no reason, e.g. `unsupported models excluded from routable catalog`. The message now states the count and the `"<upstream id>": <reason>` pairs (plus normalization warnings) verbatim, so a snapshot that drops models is diagnosable from the log alone; upstream IDs stay `%q`-quoted, so CWE-117 log injection through control characters is still impossible. Diagnostics that repeat unchanged keep the previous cadence: one line per refresh.
+
+### Verification
+
+- `go test ./...`, `go test -tags debug ./...`, `go vet ./...` and `gofmt -l .` are clean. `internal/plugin/refresh_test.go` now pins the quoted message form (and the no-raw-newline property) instead of the dropped `models` field, and `internal/plugin/integration_test.go` decodes the `warn` payload and asserts the message carries both the exclusion reason and the duplicate-entry warning.
+- Deployed to a live CLIProxyAPI v8.0.32 host by replacing the loaded plugin binary and restarting: the next catalog refresh logged `unsupported models excluded from routable catalog (6): "omen-alpha": no route determined; …` instead of the bare sentence.
+
 ## What's Changed
 
 ### Fix

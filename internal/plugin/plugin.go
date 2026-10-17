@@ -542,21 +542,25 @@ func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridg
 		}
 		return err
 	}
-	// FR-010: surface normalization diagnostics with the post-refresh log.
+	// FR-010: surface normalization diagnostics with the post-refresh log. The
+	// detail rides in the message, not in host.log fields: the host renders only
+	// its own field allowlist (provider, model, error, ...) and silently drops
+	// every other key, so a fields-only diagnostic reached the operator as a
+	// bare sentence with no model names and no reason.
 	warnings := mgr.Warnings()
 	if uns := mgr.Unsupported(); len(uns) > 0 {
 		parts := make([]string, len(uns))
 		for i, u := range uns {
 			parts[i] = fmt.Sprintf("%q: %s", u.UpstreamID, u.Reason)
 		}
-		fields := map[string]any{"models": strings.Join(parts, ", ")}
+		message := fmt.Sprintf("unsupported models excluded from routable catalog (%d): %s",
+			len(uns), strings.Join(parts, "; "))
 		if len(warnings) > 0 {
-			fields["warnings"] = strings.Join(warnings, "; ")
+			message += "; " + strings.Join(warnings, "; ")
 		}
-		_ = bridge.Log("warn", "unsupported models excluded from routable catalog", fields)
+		_ = bridge.Log("warn", message, nil)
 	} else if len(warnings) > 0 {
-		_ = bridge.Log("warn", "catalog normalization warnings",
-			map[string]any{"warnings": strings.Join(warnings, "; ")})
+		_ = bridge.Log("warn", "catalog normalization warnings: "+strings.Join(warnings, "; "), nil)
 	}
 	return nil
 }

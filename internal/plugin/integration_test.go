@@ -909,8 +909,30 @@ func TestUnroutableModelExcludedWithDiagnostic(t *testing.T) {
 	if !strings.Contains(blob, "unsupported models excluded") || !strings.Contains(blob, "weird-unknown-9x") {
 		t.Fatalf("diagnostic log missing: %s", blob)
 	}
-	if !strings.Contains(blob, `"warnings"`) || !strings.Contains(blob, "duplicate model") {
-		t.Fatalf("warnings field missing from diagnostic: %s", blob)
+	// The detail must ride in the message: the host renders only its own field
+	// allowlist, so a fields-only diagnostic shows up as a bare sentence.
+	var diag struct {
+		Level   string         `json:"level"`
+		Message string         `json:"message"`
+		Fields  map[string]any `json:"fields"`
+	}
+	found := false
+	for _, c := range f.callsOf(pluginabi.MethodHostLog) {
+		if err := json.Unmarshal(c.payload, &diag); err == nil && strings.Contains(diag.Message, "unsupported models excluded") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no unsupported-models host.log call: %s", blob)
+	}
+	if diag.Level != "warn" {
+		t.Fatalf("diagnostic level = %q, want warn", diag.Level)
+	}
+	for _, want := range []string{`"weird-unknown-9x": no route determined`, "duplicate model"} {
+		if !strings.Contains(diag.Message, want) {
+			t.Fatalf("diagnostic message missing %q: %s", want, diag.Message)
+		}
 	}
 }
 

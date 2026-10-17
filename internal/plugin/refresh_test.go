@@ -112,8 +112,9 @@ func TestRefreshUsesFirstConfiguredKey(t *testing.T) {
 }
 
 // TestRefreshUnsupportedLogQuotesNewlineIDs pins F2: a catalog entry whose
-// upstream ID carries control characters must reach the host.log "models"
-// field quoted (%q), so no raw newline can forge log lines (CWE-117).
+// upstream ID carries control characters must reach the host.log message
+// quoted (%q), so no raw newline can forge log lines (CWE-117). The detail
+// rides in the message because the host renders only its own field allowlist.
 func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	const evilID = "evil\n2027-01-01 ERROR forged host.log line"
 	cfg, err := config.Load([]byte("api-keys:\n  - value: sk-refresh-evil-key\n" +
@@ -139,14 +140,13 @@ func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	if err := json.Unmarshal(logCalls[0], &req); err != nil {
 		t.Fatalf("decode host.log payload: %v", err)
 	}
-	if req.Message != "unsupported models excluded from routable catalog" {
+	if want := "unsupported models excluded from routable catalog (1): "; !strings.HasPrefix(req.Message, want) {
 		t.Fatalf("unexpected log message: %q", req.Message)
 	}
-	modelsField, _ := req.Fields["models"].(string)
-	if strings.ContainsRune(modelsField, '\n') {
-		t.Fatalf("models log field contains raw newline (log injection): %q", modelsField)
+	if strings.ContainsRune(req.Message, '\n') {
+		t.Fatalf("log message contains raw newline (log injection): %q", req.Message)
 	}
-	if want := fmt.Sprintf("%q: ", evilID); !strings.Contains(modelsField, want) {
-		t.Fatalf("models field must quote the upstream ID; got %q, want prefix %q", modelsField, want)
+	if want := fmt.Sprintf("%q: ", evilID); !strings.Contains(req.Message, want) {
+		t.Fatalf("message must quote the upstream ID; got %q, want prefix %q", req.Message, want)
 	}
 }
