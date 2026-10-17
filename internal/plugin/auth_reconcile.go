@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,11 @@ import (
 // cfg.APIKeys: the canonical file name is managedAuthPrefix + sha256(api_key)
 // + ".json". The digest is non-secret and independent of config ordering.
 const managedAuthPrefix = "opencode-go-key-"
+
+// managedAuthStagingSuffix names the sibling a removal stages the credential
+// under while it is being proven. It deliberately does not end in .json, so the
+// host's auth-directory watcher ignores it.
+const managedAuthStagingSuffix = ".reconcile-removing-"
 
 // authRecordID is the canonical record id for one configured key.
 func authRecordID(key string) string {
@@ -345,35 +351,45 @@ func (m *Manager) removeManagedAuthRecord(ctx context.Context, id, name, path st
 	} else if !info.Mode().IsRegular() {
 		return fmt.Errorf("auth file is not a regular file")
 	}
-	staged := path + managedAuthStagingSuffix
-	if err := os.Rename(path, staged); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("stage auth file for removal failed")
+	staged, err := stageManagedAuthFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 	raw, err := os.ReadFile(staged)
 	if err != nil {
-		_ = os.Rename(staged, path)
-		return fmt.Errorf("read auth file before removal failed")
+		return restoreStagedAuthFile(staged, path, "read auth file before removal failed")
 	}
 	if _, owned, errInspect := inspectManagedAuthRecord(id, raw); errInspect != nil || !owned {
-		_ = os.Rename(staged, path)
-		return fmt.Errorf("auth file is not plugin-managed")
+		return restoreStagedAuthFile(staged, path, "auth file is not plugin-managed")
 	}
 	patched, err := setAuthRecordDisabled(raw, true)
 	if err != nil {
-		_ = os.Rename(staged, path)
-		return fmt.Errorf("undecodable credential JSON")
+		return restoreStagedAuthFile(staged, path, "undecodable credential JSON")
 	}
 	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: name, JSON: patched}); err != nil {
 		// The proven record must not be lost because the host refused the
 		// disable: put it back where the host expects it.
-		_ = os.Rename(staged, path)
-		return err
+		return restoreStagedAuthFile(staged, path, err.Error())
 	}
 	if err := os.Remove(staged); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("unlink auth file failed")
+	}
+	// The host wrote the canonical name from the JSON this plugin just built.
+	// It is read back and checked before being unlinked, so the only file this
+	// plugin ever deletes is one whose own bytes prove it is this plugin's
+	// record.
+	written, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read auth file after disabling failed")
+	}
+	if _, owned, errInspect := inspectManagedAuthRecord(id, written); errInspect != nil || !owned {
+		return fmt.Errorf("auth file changed while it was being removed; left in place")
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("unlink auth file failed")
@@ -381,10 +397,56 @@ func (m *Manager) removeManagedAuthRecord(ctx context.Context, id, name, path st
 	return nil
 }
 
-// managedAuthStagingSuffix names the sibling a removal stages the file under
-// while it is being proven. It deliberately does not end in .json, so the
-// host's auth-directory watcher ignores it.
-const managedAuthStagingSuffix = ".reconcile-removing"
+// stageManagedAuthFile moves the credential aside under a private, unique name
+// so that ownership can be proven from one inode — the one that is later
+// deleted — and so that nothing the plugin writes can land on a file it has
+// not proven. The name never ends in .json, so the host's auth-directory
+// watcher ignores it. It is created with O_EXCL before the rename, so a
+// leftover from an interrupted attempt can never be silently overwritten.
+func stageManagedAuthFile(path string) (string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", fmt.Errorf("stage auth file for removal failed")
+		}
+		staged := path + managedAuthStagingSuffix + hex.EncodeToString(suffix[:])
+		handle, err := os.OpenFile(staged, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return "", fmt.Errorf("stage auth file for removal failed")
+		}
+		if err := handle.Close(); err != nil {
+			_ = os.Remove(staged)
+			return "", fmt.Errorf("stage auth file for removal failed")
+		}
+		if err := os.Rename(path, staged); err != nil {
+			_ = os.Remove(staged)
+			if errors.Is(err, fs.ErrNotExist) {
+				return "", fs.ErrNotExist
+			}
+			return "", fmt.Errorf("stage auth file for removal failed")
+		}
+		return staged, nil
+	}
+	return "", fmt.Errorf("stage auth file for removal failed")
+}
+
+// restoreStagedAuthFile puts a staged credential back under its canonical name
+// and returns cause as the error. The link is non-overwriting on purpose: if
+// something now occupies the canonical name, the staged file is left in place
+// and its path is reported, so the operator can recover a credential this
+// plugin never got permission to replace.
+func restoreStagedAuthFile(staged, path, cause string) error {
+	if err := os.Link(staged, path); err != nil {
+		return fmt.Errorf("%s; the credential is preserved at %s", cause, staged)
+	}
+	if err := os.Remove(staged); err != nil {
+		return fmt.Errorf("%s; the credential is preserved at %s", cause, staged)
+	}
+	return fmt.Errorf("%s", cause)
+}
 
 // errAuthFileGone marks a removal whose target is already absent.
 var errAuthFileGone = errors.New("auth file is gone")

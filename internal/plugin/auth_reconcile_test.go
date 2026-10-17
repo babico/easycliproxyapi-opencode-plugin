@@ -42,6 +42,12 @@ type authHost struct {
 	listErr           bool
 	getErr            bool
 	saveErr           bool
+	// onSaveFailure runs just before a failed save returns, so a test can
+	// emulate another writer occupying the canonical path meanwhile.
+	onSaveFailure func(name string)
+	// afterSave runs after a successful save wrote the record, so a test can
+	// emulate another writer replacing it before the unlink.
+	afterSave func(name string)
 }
 
 type authHostRecord struct {
@@ -77,6 +83,22 @@ func (h *authHost) fileExists(t *testing.T, name string) bool {
 	t.Helper()
 	_, err := os.Stat(h.pathOf(name))
 	return err == nil
+}
+
+// stagedLeftovers lists any file a removal staged but did not clean up.
+func (h *authHost) stagedLeftovers(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(h.dir)
+	if err != nil {
+		t.Fatalf("read auth dir: %v", err)
+	}
+	var out []string
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), managedAuthStagingSuffix) {
+			out = append(out, entry.Name())
+		}
+	}
+	return out
 }
 
 func writeAuthFile(t *testing.T, path string, raw map[string]any) {
@@ -162,12 +184,15 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 		if gate != nil {
 			<-gate
 		}
-		if h.saveErr {
-			return hostErr("auth_save_failed", "disk full"), nil
-		}
 		var req pluginapi.HostAuthSaveRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return hostErr("invalid_request", "bad save"), nil
+		}
+		if h.saveErr {
+			if h.onSaveFailure != nil {
+				h.onSaveFailure(req.Name)
+			}
+			return hostErr("auth_save_failed", "disk full"), nil
 		}
 		var fields map[string]any
 		if err := json.Unmarshal(req.JSON, &fields); err != nil {
@@ -192,11 +217,17 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 			record.raw = fields
 			record.path = path
 			record.runtimeDisabled = disabled
+			if h.afterSave != nil {
+				h.afterSave(req.Name)
+			}
 			return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: path}), nil
 		}
 		h.records = append(h.records, &authHostRecord{
 			name: req.Name, path: path, index: "index-" + req.Name, raw: fields, runtimeDisabled: disabled,
 		})
+		if h.afterSave != nil {
+			h.afterSave(req.Name)
+		}
 		return hostOK(pluginapi.HostAuthSaveResponse{Name: req.Name, Path: path}), nil
 	case pluginabi.MethodHostLog:
 		var req struct {
@@ -547,8 +578,8 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if !logsContain(h.logMessages(), "not removed: auth file is not plugin-managed") {
 			t.Fatalf("swap diagnostic missing: %v", h.logMessages())
 		}
-		if h.fileExists(t, record.name+managedAuthStagingSuffix) {
-			t.Fatalf("staging file left behind")
+		if leftovers := h.stagedLeftovers(t); len(leftovers) != 0 {
+			t.Fatalf("staging files left behind: %v", leftovers)
 		}
 		// Nothing may be written for that record before ownership is proven: it
 		// must not have been disabled by the removal attempt. (The configured
@@ -585,8 +616,8 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		if !h.fileExists(t, record.name) {
 			t.Fatalf("record was lost when the disable save failed")
 		}
-		if h.fileExists(t, record.name+managedAuthStagingSuffix) {
-			t.Fatalf("staging file left behind after a failed save")
+		if leftovers := h.stagedLeftovers(t); len(leftovers) != 0 {
+			t.Fatalf("staging files left behind after a failed save: %v", leftovers)
 		}
 		onDisk, err := os.ReadFile(record.path)
 		if err != nil {
@@ -598,6 +629,87 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		}
 		if _, disabled := fields["disabled"]; disabled || fields["api_key"] != key {
 			t.Fatalf("record was modified by the failed removal: %v", fields)
+		}
+	})
+
+	t.Run("failed save does not clobber a file that appeared meanwhile", func(t *testing.T) {
+		h := newAuthHost(t)
+		key, keep := "sk-reconcile-rollback", "sk-reconcile-rollback-keep"
+		record := h.seedManaged(t, key, false, nil)
+		h.seedManaged(t, keep, false, nil)
+		h.saveErr = true
+		// Another writer occupies the canonical name while the disable save is
+		// failing: the rollback must not overwrite it, and the proven record
+		// must survive under its staging name.
+		h.onSaveFailure = func(string) {
+			writeAuthFile(t, record.path, map[string]any{
+				"type": ProviderID, "id": "someone-elses-id", "api_key": "sk-foreign-credential",
+			})
+		}
+		m := NewManager(NewHostBridge(h.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(keep)))
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("register rejected: %+v", env.Error)
+		}
+		onDisk, err := os.ReadFile(record.path)
+		if err != nil {
+			t.Fatalf("read canonical path: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(onDisk, &fields); err != nil {
+			t.Fatalf("decode canonical path: %v", err)
+		}
+		if fields["api_key"] != "sk-foreign-credential" {
+			t.Fatalf("rollback overwrote a foreign file: %v", fields)
+		}
+		leftovers := h.stagedLeftovers(t)
+		if len(leftovers) != 1 {
+			t.Fatalf("proven record was not preserved for recovery: %v", leftovers)
+		}
+		if !logsContain(h.logMessages(), "preserved at") {
+			t.Fatalf("recovery path not reported: %v", h.logMessages())
+		}
+	})
+
+	t.Run("canonical file replaced after the disable save is not deleted", func(t *testing.T) {
+		h := newAuthHost(t)
+		key, keep := "sk-reconcile-after-save", "sk-reconcile-after-save-keep"
+		record := h.seedManaged(t, key, false, nil)
+		h.seedManaged(t, keep, false, nil)
+		h.afterSave = func(name string) {
+			if name != record.name {
+				return
+			}
+			writeAuthFile(t, record.path, map[string]any{
+				"type": ProviderID, "id": "someone-elses-id", "api_key": "sk-foreign-credential",
+			})
+		}
+		m := NewManager(NewHostBridge(h.call))
+		t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+		resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(keep)))
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("register rejected: %+v", env.Error)
+		}
+		onDisk, err := os.ReadFile(record.path)
+		if err != nil {
+			t.Fatalf("read canonical path: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(onDisk, &fields); err != nil {
+			t.Fatalf("decode canonical path: %v", err)
+		}
+		if fields["api_key"] != "sk-foreign-credential" {
+			t.Fatalf("a replacement file was deleted: %v", fields)
+		}
+		if !logsContain(h.logMessages(), "changed while it was being removed") {
+			t.Fatalf("replacement diagnostic missing: %v", h.logMessages())
 		}
 	})
 
