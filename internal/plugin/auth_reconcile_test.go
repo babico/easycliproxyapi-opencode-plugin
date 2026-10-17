@@ -52,6 +52,10 @@ type authHostRecord struct {
 	// listedID, when non-empty, is what host.auth.list reports instead of the
 	// canonical id (host input the plugin must not trust or echo).
 	listedID string
+	// listedPath, when non-empty, is the path host.auth.list reports while
+	// host.auth.get keeps returning path — a disagreement the plugin must
+	// refuse to act on.
+	listedPath string
 }
 
 type savedAuth struct {
@@ -112,6 +116,9 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 				RuntimeOnly: record.runtimeOnly,
 				Source:      "file",
 				Path:        record.path,
+			}
+			if record.listedPath != "" {
+				entry.Path = record.listedPath
 			}
 			if !h.diskOnly {
 				entry.ID = strings.TrimSuffix(record.name, ".json")
@@ -464,15 +471,63 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 		h.seed(t, id+".json", map[string]any{
 			"type": ProviderID, "id": id, "api_key": foreignKey,
 		}, false)
-		registerReconciled(t, h, reconcileYAML(nameKey))
-		if got := len(h.savedAuths()); got != 0 {
-			t.Fatalf("unowned record rewritten: %+v", h.savedAuths())
+		// The key is NOT configured, so this record is a removal candidate: the
+		// ownership proof is what must stop the unlink.
+		registerReconciled(t, h, reconcileYAML("sk-reconcile-other"))
+		if got := len(h.savedAuths()); got != 1 {
+			t.Fatalf("unexpected saves: %+v", h.savedAuths())
 		}
 		if !logsContain(h.logMessages(), "not plugin-managed") {
 			t.Fatalf("ownership diagnostic missing: %v", h.logMessages())
 		}
 		if !h.fileExists(t, id+".json") {
 			t.Fatalf("unowned record was removed")
+		}
+	})
+
+	t.Run("deletion target replaced after the host read", func(t *testing.T) {
+		h := newAuthHost(t)
+		key := "sk-reconcile-swapped"
+		record := h.seedManaged(t, key, false, nil)
+		// The host's in-memory read still describes our record, but the file on
+		// disk now holds a different credential: the unlink must refuse it and
+		// put it back.
+		foreign := map[string]any{"type": ProviderID, "id": "someone-elses-id", "api_key": "sk-foreign-credential"}
+		writeAuthFile(t, record.path, foreign)
+		registerReconciled(t, h, reconcileYAML("sk-reconcile-swapped-other"))
+		if !h.fileExists(t, record.name) {
+			t.Fatalf("swapped file was deleted")
+		}
+		onDisk, err := os.ReadFile(record.path)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(onDisk, &fields); err != nil {
+			t.Fatalf("decode back: %v", err)
+		}
+		if fields["api_key"] != "sk-foreign-credential" {
+			t.Fatalf("swapped file was rewritten: %v", fields)
+		}
+		if !logsContain(h.logMessages(), "not removed: auth file is not plugin-managed") {
+			t.Fatalf("swap diagnostic missing: %v", h.logMessages())
+		}
+		if h.fileExists(t, record.name+managedAuthStagingSuffix) {
+			t.Fatalf("staging file left behind")
+		}
+	})
+
+	t.Run("list and read disagree on the path", func(t *testing.T) {
+		h := newAuthHost(t)
+		key := "sk-reconcile-path-mismatch"
+		record := h.seedManaged(t, key, false, nil)
+		record.listedPath = filepath.Join(h.dir, "elsewhere", record.name)
+		registerReconciled(t, h, reconcileYAML("sk-reconcile-path-mismatch-other"))
+		if !h.fileExists(t, record.name) {
+			t.Fatalf("record was removed on a path disagreement")
+		}
+		if !logsContain(h.logMessages(), "listed a different path than it read") {
+			t.Fatalf("path-mismatch diagnostic missing: %v", h.logMessages())
 		}
 	})
 
@@ -607,14 +662,54 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 	})
 }
 
+// TestReconcileRestoresConfiguredKeyWhoseFileVanished pins the delete-then-
+// restore gap: a key put back into the config while the host still lists the
+// unlinked record must end up with a working credential, not a skipped pass.
+func TestReconcileRestoresConfiguredKeyWhoseFileVanished(t *testing.T) {
+	h := newAuthHost(t)
+	key := "sk-reconcile-restore-gap"
+	record := h.seedManaged(t, key, false, nil)
+	if err := os.Remove(record.path); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	h.keepStaleListings = true
+	h.getErr = true
+	m := NewManager(NewHostBridge(h.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(key)))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("register rejected: %+v", env.Error)
+	}
+	if !h.fileExists(t, record.name) {
+		t.Fatalf("configured credential was not restored")
+	}
+	onDisk, err := os.ReadFile(record.path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(onDisk, &fields); err != nil {
+		t.Fatalf("decode back: %v", err)
+	}
+	if fields["api_key"] != key {
+		t.Fatalf("restored record carries the wrong key: %v", fields)
+	}
+	if !logsContain(h.logMessages(), "restored: its file was gone while the host still listed it") {
+		t.Fatalf("restore diagnostic missing: %v", h.logMessages())
+	}
+}
+
 // TestReconcileToleratesRecordVanishingBetweenListAndGet pins the race that
 // unlinked a record and then failed registration: the host keeps its runtime
 // entry until the auth-directory watcher processes the removal, so the next
 // pass lists a record whose file is already gone.
 func TestReconcileToleratesRecordVanishingBetweenListAndGet(t *testing.T) {
 	h := newAuthHost(t)
-	key, keep := "sk-reconcile-vanish", "sk-reconcile-vanish-keep"
-	record := h.seedManaged(t, key, false, nil)
+	goneKey, keep := "sk-reconcile-vanish", "sk-reconcile-vanish-keep"
+	record := h.seedManaged(t, goneKey, false, nil)
 	h.seedManaged(t, keep, false, nil)
 	// The file is gone but the listing still reports the runtime entry.
 	if err := os.Remove(record.path); err != nil {
@@ -624,7 +719,9 @@ func TestReconcileToleratesRecordVanishingBetweenListAndGet(t *testing.T) {
 	h.getErr = true
 	m := NewManager(NewHostBridge(h.call))
 	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
-	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(key, keep)))
+	// goneKey is NOT configured, so there is nothing to restore: the pass must
+	// report and move on without writing or failing registration.
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(keep)))
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -633,6 +730,9 @@ func TestReconcileToleratesRecordVanishingBetweenListAndGet(t *testing.T) {
 	}
 	if got := len(h.savedAuths()); got != 0 {
 		t.Fatalf("vanished record produced %d write(s)", got)
+	}
+	if !logsContain(h.logMessages(), "not reconciled: host auth get failed") {
+		t.Fatalf("vanished-record diagnostic missing: %v", h.logMessages())
 	}
 }
 

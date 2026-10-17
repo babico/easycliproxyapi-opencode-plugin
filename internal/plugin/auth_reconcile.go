@@ -65,8 +65,11 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 		return fmt.Errorf("list existing auth records: %w", err)
 	}
 	expected := make(map[string]struct{}, len(cfg.APIKeys))
+	keyByID := make(map[string]string, len(cfg.APIKeys))
 	for _, key := range cfg.APIKeys {
-		expected[authRecordID(key.Value)] = struct{}{}
+		id := authRecordID(key.Value)
+		expected[id] = struct{}{}
+		keyByID[id] = key.Value
 	}
 	known := make(map[string]struct{}, len(entries)*2)
 	for _, entry := range entries {
@@ -85,27 +88,35 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 		if _, ok := known[id+".json"]; ok {
 			continue
 		}
-		record, err := json.Marshal(struct {
-			Type   string `json:"type"`
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			APIKey string `json:"api_key"`
-		}{
-			Type: ProviderID, ID: id,
-			Label:  "OpenCode Go credential " + strings.TrimPrefix(id, managedAuthPrefix),
-			APIKey: key.Value,
-		})
-		if err != nil {
-			return fmt.Errorf("build auth record")
-		}
-		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: id + ".json", JSON: record}); err != nil {
+		if err := m.saveManagedAuthRecord(ctx, id, key.Value); err != nil {
 			return err
 		}
 		known[id] = struct{}{}
 		known[id+".json"] = struct{}{}
-		debugTrace("auth materialized id=%s file=%s", id, id+".json")
 	}
-	return m.reconcileManagedAuthState(ctx, entries, expected)
+	return m.reconcileManagedAuthState(ctx, entries, expected, keyByID)
+}
+
+// saveManagedAuthRecord writes the canonical record for one configured key.
+func (m *Manager) saveManagedAuthRecord(ctx context.Context, id, value string) error {
+	record, err := json.Marshal(struct {
+		Type   string `json:"type"`
+		ID     string `json:"id"`
+		Label  string `json:"label"`
+		APIKey string `json:"api_key"`
+	}{
+		Type: ProviderID, ID: id,
+		Label:  "OpenCode Go credential " + strings.TrimPrefix(id, managedAuthPrefix),
+		APIKey: value,
+	})
+	if err != nil {
+		return fmt.Errorf("build auth record")
+	}
+	if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: id + ".json", JSON: record}); err != nil {
+		return err
+	}
+	debugTrace("auth materialized id=%s file=%s", id, id+".json")
+	return nil
 }
 
 // reconcileManagedAuthState deletes managed records whose key is no longer
@@ -117,7 +128,7 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 // A record that cannot be read, proven or written is left alone and reported as
 // a warn: this function never reports a state it did not verify, and it never
 // fails the caller, because failing registration takes the whole provider down.
-func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []pluginapi.HostAuthFileEntry, expected map[string]struct{}) error {
+func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []pluginapi.HostAuthFileEntry, expected map[string]struct{}, keyByID map[string]string) error {
 	deferred := 0
 	for _, entry := range entries {
 		id, ok := managedAuthID(entry)
@@ -151,10 +162,23 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		}
 		fetched, err := m.bridge.AuthGet(ctx, entry.AuthIndex)
 		if err != nil {
-			// The record cannot be read (it was just unlinked and the host has
-			// not dropped it from its runtime list yet, the index is stale, the
-			// read timed out). Ownership cannot be proven without the raw JSON,
-			// so leave it alone and report: the next pass re-lists.
+			// The record cannot be read: it was just unlinked and the host has
+			// not dropped it from its runtime list yet, the index is stale, or
+			// the read timed out. Ownership cannot be proven without the raw
+			// JSON. A configured key whose backing file is provably absent is
+			// the one case that needs no proof — there is nothing to overwrite
+			// — so recreate it; anything else is left alone and reported.
+			value, configured := keyByID[id]
+			if configured && managedAuthFileMissing(entry.Name, entry.Path) {
+				if err := m.saveManagedAuthRecord(ctx, id, value); err != nil {
+					_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not restored: %v",
+						shortAuthID(id), err), nil)
+					continue
+				}
+				_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s restored: its file was gone while the host still listed it",
+					shortAuthID(id)), nil)
+				continue
+			}
 			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: %v",
 				shortAuthID(id), err), nil)
 			continue
@@ -166,6 +190,13 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		}
 		if name := strings.TrimSpace(fetched.Name); name != "" && name != strings.TrimSpace(entry.Name) {
 			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host returned a different file name",
+				shortAuthID(id)), nil)
+			continue
+		}
+		// The read must describe the file the listing named, or the ownership
+		// proof would apply to one path while the mutation targets another.
+		if path := strings.TrimSpace(fetched.Path); path != "" && path != strings.TrimSpace(entry.Path) {
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host listed a different path than it read",
 				shortAuthID(id)), nil)
 			continue
 		}
@@ -181,7 +212,7 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 			continue
 		}
 		if !configured {
-			if err := removeManagedAuthFile(entry.Name, entry.Path); err != nil {
+			if err := removeManagedAuthFile(id, entry.Name, entry.Path); err != nil {
 				_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not removed: %v",
 					shortAuthID(id), err), nil)
 				continue
@@ -280,30 +311,70 @@ func managedAuthName(name string) bool {
 }
 
 // removeManagedAuthFile unlinks one managed auth file and lets the host's
-// auth-directory watcher unregister the credential. The reported path must be
-// an absolute, non-symlink regular file named exactly like the managed record:
-// the caller has already proven the record's ownership from its raw JSON, and
-// this check keeps a hostile/odd path from pointing the unlink elsewhere.
-func removeManagedAuthFile(name, path string) error {
+// auth-directory watcher unregister the credential.
+//
+// The ownership proof the caller obtained came from a host read of that record,
+// so the unlink must be bound to the very file that was proven, not merely to
+// the name it was listed under: the file is first renamed to a non-.json
+// sibling (atomic, and invisible to the host watcher), then the RENAMED file is
+// read and its record must again prove ownership — same type, same canonical
+// id, same api_key digest — before it is deleted. A file that does not prove
+// ownership is renamed back untouched. The rename also closes the window in
+// which a concurrent writer could swap the file between the proof and the
+// unlink: what gets deleted is the inode that was just verified.
+func removeManagedAuthFile(id, name, path string) error {
 	name = strings.TrimSpace(name)
 	path = strings.TrimSpace(path)
 	if !managedAuthName(name) || !filepath.IsAbs(path) || filepath.Base(path) != name {
 		return fmt.Errorf("host did not report a usable auth file path")
 	}
-	info, err := os.Lstat(path)
-	if err != nil {
+	if info, err := os.Lstat(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("inspect auth file failed")
-	}
-	if !info.Mode().IsRegular() {
+	} else if !info.Mode().IsRegular() {
 		return fmt.Errorf("auth file is not a regular file")
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	staged := path + managedAuthStagingSuffix
+	if err := os.Rename(path, staged); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stage auth file for removal failed")
+	}
+	raw, err := os.ReadFile(staged)
+	if err != nil {
+		_ = os.Rename(staged, path)
+		return fmt.Errorf("read auth file before removal failed")
+	}
+	if _, owned, errInspect := inspectManagedAuthRecord(id, raw); errInspect != nil || !owned {
+		_ = os.Rename(staged, path)
+		return fmt.Errorf("auth file is not plugin-managed")
+	}
+	if err := os.Remove(staged); err != nil {
+		_ = os.Rename(staged, path)
 		return fmt.Errorf("unlink auth file failed")
 	}
 	return nil
+}
+
+// managedAuthStagingSuffix names the sibling used while verifying a file for
+// removal. It deliberately does not end in .json, so the host's auth-directory
+// watcher ignores it.
+const managedAuthStagingSuffix = ".reconcile-removing"
+
+// managedAuthFileMissing reports whether the canonical path a listing named is
+// provably absent. Only an absolute path with the canonical file name counts,
+// so a hostile or odd listing cannot steer the answer.
+func managedAuthFileMissing(name, path string) bool {
+	name = strings.TrimSpace(name)
+	path = strings.TrimSpace(path)
+	if !managedAuthName(name) || !filepath.IsAbs(path) || filepath.Base(path) != name {
+		return false
+	}
+	_, err := os.Lstat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // shortAuthID is the 12-hex-prefix form used in logs.
