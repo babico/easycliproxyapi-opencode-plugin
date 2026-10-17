@@ -127,9 +127,9 @@ func fallbackMessage(e *Error) string {
 	return fmt.Sprintf("%s without a message", class)
 }
 
-// ToEnvelopeError converts to the shared SDK wire type. The message is reported
-// verbatim: redaction was removed deliberately so an upstream reason is
-// diagnosable (see RELEASE_NOTES v0.1.13).
+// ToEnvelopeError converts to the SDK wire type. Upstream reason text is kept;
+// generic JSON request-fault markers on eligible HTTP failures are normalized
+// so the host can continue credential failover (see report.go).
 func ToEnvelopeError(e *Error) pluginabi.Error {
 	status := e.StatusCode
 	if status == 0 {
@@ -146,7 +146,7 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 	}
 	return pluginabi.Error{
 		Code:       string(e.Class),
-		Message:    message,
+		Message:    reportedMessage(e, message),
 		Retryable:  e.Retryable,
 		HTTPStatus: status,
 	}

@@ -1462,3 +1462,34 @@ func TestE2EClaudeClientToResponsesRoute(t *testing.T) {
 		t.Fatal("upstream did not receive a Responses-format request")
 	}
 }
+
+// TestUpstreamCredentialFailureReportsRotationSafeBody pins the classifier trap
+// end to end through the plugin's own path: the host decides from the reported
+// body whether the caller's request is at fault, and a request-fault marker
+// stops credential rotation. An upstream that describes an invalid credential
+// with one (DeepSeek reports an invalid key as a generic invalid_request_error)
+// must not be able to turn a credential failure into a client-visible dead end.
+func TestUpstreamCredentialFailureReportsRotationSafeBody(t *testing.T) {
+	m, _, st, _ := newIntegrationManager(t)
+	st.setChatPlan(func(int) (int, string, string) {
+		return http.StatusUnauthorized, "",
+			`{"error":{"type":"invalid_request_error","message":"Authentication Fails"}}`
+	})
+	env := mustExecute(t, m, "opencode-go/glm-5.2", "openai",
+		[]byte(`{"model":"opencode-go/glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %+v", env)
+	}
+	if env.Error.HTTPStatus != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", env.Error.HTTPStatus)
+	}
+	if strings.Contains(env.Error.Message, "invalid_request_error") {
+		t.Fatalf("reported body still looks like a request fault: %s", env.Error.Message)
+	}
+	if !strings.Contains(env.Error.Message, "authentication_error") {
+		t.Fatalf("reported body does not name the credential failure: %s", env.Error.Message)
+	}
+	if !strings.Contains(env.Error.Message, "Authentication Fails") {
+		t.Fatalf("upstream reason dropped: %s", env.Error.Message)
+	}
+}

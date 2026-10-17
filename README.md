@@ -29,7 +29,7 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
   - Anthropic Messages (`/v1/messages`)
   - OpenAI Responses (`/v1/responses`)
 - **Reasoning Effort Pass-through**: Forwards explicit effort values unchanged, without local capability checks, normalization, or downgrade. The upstream owns validation.
-- **Explainable failures**: a streaming request the upstream refuses before the first byte reports that status plus up to 2 KiB of its error body verbatim, instead of an empty message the host renders as `plugin call failed`.
+- **Explainable failures**: a streaming request refused before the first byte reports the upstream status and up to 2 KiB of its error body. Reason text is preserved; ambiguous JSON request-fault markers on eligible 401/403/5xx failures are normalized so CPA can try another credential. See [Error reporting and failover](#error-reporting-and-failover).
 - **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
 - **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
 - **Config-authoritative credentials**: `api-keys` is the single source of truth. Every configured key is materialized as a CPA auth record; a key removed from the config has its record **deleted** (the auth file is unlinked, since the plugin ABI has no delete callback, and CPA's auth-directory watcher unregisters it), and putting the key back recreates it. Records the plugin cannot prove it created are never touched. See [Credential reconciliation](#credential-reconciliation).
@@ -60,6 +60,14 @@ go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cliproxyapi.dyl
 ```
 
 Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
+
+## Error reporting and failover
+
+Each executor call uses the credential selected by CPA. A refused attempt returns an error to **CPA**, not necessarily to the client: CPA can select another key within the same downstream request. The plugin does not implement a second retry/key-selection loop.
+
+CPA v8.0.32 classifies errors from HTTP status and JSON `type`/`code` fields; its plugin adapter does not consume the envelope's `Retryable` field. For retryable HTTP 401/403/500–599 with matching plugin classes, generic `invalid_request`, `invalid_request_error` and `bad_request_error` markers are normalized at the root, `error`, `response.error` and `body.error`. Types become `authentication_error` (401), `permission_error` (403), or `server_error` (5xx); a generic code becomes the plugin's existing error-class code. HTTP status, envelope metadata, upstream reason text and unrelated JSON values are retained.
+
+Specific request faults (context limits, policy/prompt rejection, invalid/unsupported values, missing previous responses), model-not-found codes, and CPA's existing authentication escape case remain byte-identical. So do 402/429 (CPA already permits credential failover), genuine 400-class request errors, malformed/truncated or duplicate-key JSON, and reports without matching markers. Generic markers remain ambiguous: normalization is a bounded status-based heuristic, not proof that every 403/5xx can be fixed by another key. Network causes and post-emission streaming failures are unchanged; no I/O error is invented to manipulate cooldowns.
 
 ## Reasoning effort pass-through
 
