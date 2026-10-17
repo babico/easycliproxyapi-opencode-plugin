@@ -309,8 +309,12 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	debugTrace("lifecycle config_loaded key_count=%d prefix_enabled=%t prefix=%s", len(cfg.APIKeys), cfg.ModelPrefix.Enabled, cfg.ModelPrefix.Value)
 	ctx, cancel := context.WithTimeout(context.Background(), registerRefreshTimeout)
 	defer cancel()
+	// Credential housekeeping is best-effort by design: a failed registration
+	// makes the host drop the plugin, which takes every model of this provider
+	// off the air — strictly worse than a credential that is one pass behind.
+	// Every failure is reported as a warn and retried by the next reconfigure.
 	if err := m.reconcileAuthRecords(ctx, cfg); err != nil {
-		return ErrEnvelope("auth_materialization_failed", err.Error()), nil
+		_ = m.bridge.Log("warn", "credential reconciliation failed: "+err.Error(), nil)
 	}
 	// A nil *HostBridge must not enter the interface as a typed nil, or
 	// catalog's nil-client guard never fires and Refresh panics inside Do.

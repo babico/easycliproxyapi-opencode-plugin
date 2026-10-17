@@ -629,15 +629,22 @@ func TestLifecycleAuthListFailureDoesNotWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
-		t.Fatalf("list failure envelope = %+v", env.Error)
+	// Credential housekeeping must not take the provider down: the failure is
+	// reported as a warn and the plugin still registers its models.
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("list failure must not fail registration: %+v", env.Error)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostAuthSave)); got != 0 {
 		t.Fatalf("auth saves after list failure = %d, want 0", got)
 	}
-	if got := len(f.callsOf(pluginabi.MethodHostHTTPDo)); got != 0 {
-		t.Fatalf("catalog calls after list failure = %d, want 0", got)
+	var warned bool
+	for _, call := range f.callsOf(pluginabi.MethodHostLog) {
+		if strings.Contains(string(call.payload), "credential reconciliation failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatal("list failure produced no warn diagnostic")
 	}
 }
 

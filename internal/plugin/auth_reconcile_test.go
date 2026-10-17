@@ -34,9 +34,12 @@ type authHost struct {
 	// diskOnly emulates a host that has not attached its auth manager yet:
 	// plain host.auth.list reads the directory and carries no id/auth_index.
 	diskOnly bool
-	listErr  bool
-	getErr   bool
-	saveErr  bool
+	// keepStaleListings emulates the window between an unlink and the host
+	// dropping the runtime entry: the listing still reports the record.
+	keepStaleListings bool
+	listErr           bool
+	getErr            bool
+	saveErr           bool
 }
 
 type authHostRecord struct {
@@ -89,13 +92,15 @@ func (h *authHost) call(method string, payload []byte) ([]byte, error) {
 		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		kept := h.records[:0]
-		for _, record := range h.records {
-			if _, err := os.Stat(record.path); err == nil {
-				kept = append(kept, record)
+		if !h.keepStaleListings {
+			kept := h.records[:0]
+			for _, record := range h.records {
+				if _, err := os.Stat(record.path); err == nil {
+					kept = append(kept, record)
+				}
 			}
+			h.records = kept
 		}
-		h.records = kept
 		files := make([]pluginapi.HostAuthFileEntry, 0, len(h.records))
 		for _, record := range h.records {
 			entry := pluginapi.HostAuthFileEntry{
@@ -515,8 +520,9 @@ func TestReconcileNeverRewritesUnownedRecord(t *testing.T) {
 	})
 }
 
-// TestReconcileSurfacesFailures keeps a failed read or write visible instead of
-// pretending the pool matches the config.
+// TestReconcileSurfacesFailures keeps a failed read or write visible — as a warn
+// that leaves the provider registered — instead of pretending the pool matches
+// the config or taking every model of this provider off the air.
 func TestReconcileSurfacesFailures(t *testing.T) {
 	t.Run("get failure", func(t *testing.T) {
 		h := newAuthHost(t)
@@ -529,15 +535,21 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		env := decodeEnv(t, resp)
-		if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
-			t.Fatalf("get failure envelope = %+v", env.Error)
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("unreadable credential must not fail registration: %+v", env.Error)
 		}
-		if strings.Contains(env.Error.Message, "sk-secret-in-error") {
-			t.Fatalf("host error text leaked into envelope: %s", env.Error.Message)
+		logs := h.logMessages()
+		if !logsContain(logs, "not reconciled: host auth get failed") {
+			t.Fatalf("get failure diagnostic missing: %v", logs)
+		}
+		if logsContain(logs, "sk-secret-in-error") {
+			t.Fatalf("host error text leaked into logs: %v", logs)
 		}
 		if got := len(h.savedAuths()); got != 0 {
 			t.Fatalf("get failure still wrote %d record(s)", got)
+		}
+		if !h.fileExists(t, authRecordID(key)+".json") {
+			t.Fatalf("unreadable credential was disturbed")
 		}
 	})
 
@@ -553,9 +565,11 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		env := decodeEnv(t, resp)
-		if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" {
-			t.Fatalf("save failure envelope = %+v", env.Error)
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("failed save must not fail registration: %+v", env.Error)
+		}
+		if !logsContain(h.logMessages(), "not re-enabled: host auth save failed") {
+			t.Fatalf("save failure diagnostic missing: %v", h.logMessages())
 		}
 		if !h.fileExists(t, authRecordID(key)+".json") {
 			t.Fatalf("failed save deleted the credential")
@@ -581,15 +595,45 @@ func TestReconcileSurfacesFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("register: %v", err)
 		}
-		env := decodeEnv(t, resp)
-		if env.OK || env.Error == nil || env.Error.Code != "auth_materialization_failed" ||
-			!strings.Contains(env.Error.Message, "remove credential") {
-			t.Fatalf("delete failure envelope = %+v", env.Error)
+		if env := decodeEnv(t, resp); !env.OK {
+			t.Fatalf("failed removal must not fail registration: %+v", env.Error)
+		}
+		if !logsContain(h.logMessages(), "not removed: auth file is not a regular file") {
+			t.Fatalf("delete failure diagnostic missing: %v", h.logMessages())
 		}
 		if info, errStat := os.Stat(dirPath); errStat != nil || !info.IsDir() {
 			t.Fatalf("non-regular path was disturbed: %v", errStat)
 		}
 	})
+}
+
+// TestReconcileToleratesRecordVanishingBetweenListAndGet pins the race that
+// unlinked a record and then failed registration: the host keeps its runtime
+// entry until the auth-directory watcher processes the removal, so the next
+// pass lists a record whose file is already gone.
+func TestReconcileToleratesRecordVanishingBetweenListAndGet(t *testing.T) {
+	h := newAuthHost(t)
+	key, keep := "sk-reconcile-vanish", "sk-reconcile-vanish-keep"
+	record := h.seedManaged(t, key, false, nil)
+	h.seedManaged(t, keep, false, nil)
+	// The file is gone but the listing still reports the runtime entry.
+	if err := os.Remove(record.path); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	h.keepStaleListings = true
+	h.getErr = true
+	m := NewManager(NewHostBridge(h.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(reconcileYAML(key, keep)))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("vanished record must not fail registration: %+v", env.Error)
+	}
+	if got := len(h.savedAuths()); got != 0 {
+		t.Fatalf("vanished record produced %d write(s)", got)
+	}
 }
 
 // TestReconcileConvergesAfterManagerRestart pins idempotency across a fresh
@@ -709,9 +753,11 @@ func TestReconcileWaitsForOutstandingSave(t *testing.T) {
 	// Pass 1 wants to re-enable the key, but the save outlives its deadline.
 	shortCtx, cancelShort := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancelShort()
-	if err := m.reconcileAuthRecords(shortCtx, withKey); err == nil ||
-		!strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("outlived save error = %v, want timeout", err)
+	if err := m.reconcileAuthRecords(shortCtx, withKey); err != nil {
+		t.Fatalf("outlived save pass = %v, want the failure reported as a warn", err)
+	}
+	if !logsContain(h.logMessages(), "not re-enabled: host auth save failed: timed out") {
+		t.Fatalf("outlived save diagnostic missing: %v", h.logMessages())
 	}
 
 	// Pass 2 drops the key. It must not act while the orphaned enable can still

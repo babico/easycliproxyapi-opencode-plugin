@@ -113,6 +113,10 @@ func (m *Manager) reconcileAuthRecords(ctx context.Context, cfg config.Config) e
 // the PHYSICAL JSON, so a disk/runtime disagreement is repaired; the enable
 // write happens only when a state differs, which keeps repeated reconfigures
 // and manager restarts save-free.
+//
+// A record that cannot be read, proven or written is left alone and reported as
+// a warn: this function never reports a state it did not verify, and it never
+// fails the caller, because failing registration takes the whole provider down.
 func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []pluginapi.HostAuthFileEntry, expected map[string]struct{}) error {
 	deferred := 0
 	for _, entry := range entries {
@@ -147,17 +151,29 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		}
 		fetched, err := m.bridge.AuthGet(ctx, entry.AuthIndex)
 		if err != nil {
-			return err
+			// The record cannot be read (it was just unlinked and the host has
+			// not dropped it from its runtime list yet, the index is stale, the
+			// read timed out). Ownership cannot be proven without the raw JSON,
+			// so leave it alone and report: the next pass re-lists.
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: %v",
+				shortAuthID(id), err), nil)
+			continue
 		}
 		if fetched.AuthIndex != entry.AuthIndex {
-			return fmt.Errorf("read credential %s: host returned a different index", shortAuthID(id))
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host returned a different index",
+				shortAuthID(id)), nil)
+			continue
 		}
 		if name := strings.TrimSpace(fetched.Name); name != "" && name != strings.TrimSpace(entry.Name) {
-			return fmt.Errorf("read credential %s: host returned a different file name", shortAuthID(id))
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the host returned a different file name",
+				shortAuthID(id)), nil)
+			continue
 		}
 		physicalDisabled, managed, err := inspectManagedAuthRecord(id, fetched.JSON)
 		if err != nil {
-			return fmt.Errorf("read credential %s: undecodable credential JSON", shortAuthID(id))
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: undecodable credential JSON",
+				shortAuthID(id)), nil)
+			continue
 		}
 		if !managed {
 			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not reconciled: the record is not plugin-managed",
@@ -166,7 +182,9 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		}
 		if !configured {
 			if err := removeManagedAuthFile(entry.Name, entry.Path); err != nil {
-				return fmt.Errorf("remove credential %s: %w", shortAuthID(id), err)
+				_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not removed: %v",
+					shortAuthID(id), err), nil)
+				continue
 			}
 			_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s removed: no longer listed in configured api-keys",
 				shortAuthID(id)), nil)
@@ -177,10 +195,14 @@ func (m *Manager) reconcileManagedAuthState(ctx context.Context, entries []plugi
 		}
 		patched, err := setAuthRecordDisabled(fetched.JSON, false)
 		if err != nil {
-			return fmt.Errorf("read credential %s: undecodable credential JSON", shortAuthID(id))
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not re-enabled: undecodable credential JSON",
+				shortAuthID(id)), nil)
+			continue
 		}
 		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: entry.Name, JSON: patched}); err != nil {
-			return err
+			_ = m.bridge.Log("warn", fmt.Sprintf("opencode-go credential %s not re-enabled: %v",
+				shortAuthID(id), err), nil)
+			continue
 		}
 		_ = m.bridge.Log("info", fmt.Sprintf("opencode-go credential %s enabled: listed in configured api-keys",
 			shortAuthID(id)), nil)
