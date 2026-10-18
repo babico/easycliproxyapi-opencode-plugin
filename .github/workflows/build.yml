@@ -214,19 +214,33 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y clang lld wget
+          # go-cross/cgo-actions@v1 hardcodes FreeBSD 14.3 for both the sysroot
+          # download and the clang target triple. 14.3-RELEASE is gone from
+          # download.freebsd.org/releases (404) and archive.freebsd.org, which
+          # still carries it, does not complete a TLS handshake, so these two
+          # shims move the build to 14.4-RELEASE, the oldest release still
+          # published. The resulting library therefore needs FreeBSD 14.4+.
           cat << 'EOF' | sudo tee /usr/local/bin/wget >/dev/null
           #!/bin/bash
           args=()
           for a in "$@"; do
-            if [[ "$a" == *"download.freebsd.org/releases/"*"/14.3-RELEASE/base.txz"* ]]; then
-              args+=("${a/download.freebsd.org\/releases/archive.freebsd.org\/old-releases}")
+            if [[ "$a" == *"download.freebsd.org/releases/"* ]]; then
+              args+=("${a//14.3-RELEASE/14.4-RELEASE}")
             else
               args+=("$a")
             fi
           done
           exec /usr/bin/wget "${args[@]}"
           EOF
-          sudo chmod +x /usr/local/bin/wget
+          cat << 'EOF' | sudo tee /usr/local/bin/clang >/dev/null
+          #!/bin/bash
+          args=()
+          for a in "$@"; do
+            args+=("${a//unknown-freebsd14.3/unknown-freebsd14.4}")
+          done
+          exec /usr/bin/clang "${args[@]}"
+          EOF
+          sudo chmod +x /usr/local/bin/wget /usr/local/bin/clang
 
       - name: Build FreeBSD shared library
         timeout-minutes: 45
