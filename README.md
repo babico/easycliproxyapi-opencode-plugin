@@ -46,17 +46,17 @@ Build the dynamic shared library for your platform:
 
 ### Windows (AMD64)
 ```powershell
-go build -buildmode=c-shared -o plugins/windows/amd64/opencode-go-cliproxyapi.dll .
+go build -buildmode=c-shared -o plugins/windows/amd64/opencode-go-provider.dll .
 ```
 
 ### Linux (AMD64)
 ```bash
-go build -buildmode=c-shared -o plugins/linux/amd64/opencode-go-cliproxyapi.so .
+go build -buildmode=c-shared -o plugins/linux/amd64/opencode-go-provider.so .
 ```
 
 ### macOS (ARM64)
 ```bash
-go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cliproxyapi.dylib .
+go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-provider.dylib .
 ```
 
 Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
@@ -106,12 +106,12 @@ The client → upstream replay is gated because replaying a field an endpoint ne
 
 ## Configuration
 
-Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-cliproxyapi`:
+Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-provider`:
 
 ```yaml
 plugins:
   configs:
-    opencode-go-cliproxyapi:
+    opencode-go-provider:
       # Upstream base URL (default: "https://opencode.ai/zen/go/v1")
       base-url: "https://opencode.ai/zen/go/v1"
 
@@ -194,11 +194,13 @@ Two limits are worth knowing:
 - **Bootstrap has no runtime index.** Until the host attaches its auth manager, `host.auth.list` reads the auth directory and returns neither `id` nor `auth_index`, so the raw record cannot be read and ownership cannot be proven. Creation still happens; a record whose state disagrees with the config is reported as deferred (`opencode-go credential reconciliation deferred for N record(s)`). CLIProxyAPI v8 applies the plugin config again once the auth manager is attached, which finishes the work at startup; a host that never reconfigures keeps the old record and the deferral line, and never has an index guessed for it.
 - **Credential housekeeping never takes the provider down.** A read, write or unlink that fails is reported as a `warn` (e.g. `credential reconciliation failed: …`, `opencode-go credential <hash> not removed: …`) and the plugin still registers its models; the next reconfigure retries. Failing registration would make the host drop the plugin and take every model of this provider off the air, which is worse than a credential that is one pass behind. A save that times out is an **unknown commit** — the host callback keeps running — so the bridge counts it as outstanding: the next reconciliation waits for it to settle before reading or writing, and if it does not settle inside the lifecycle deadline the pass reports that instead of a state the orphan could still overwrite.
 
-## Install via the plugin store (this fork)
+## Install via the plugin store
 
-This fork publishes its own plugin-store registry so CLIProxyAPI can install and update it from this repository's GitHub releases. The release assets already follow the store layout (`opencode-go-cliproxyapi_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
+This plugin is listed in the official CLIProxyAPI plugin store under the id `opencode-go-provider`, so Management Center → Plugin Store installs and updates it from this repository's GitHub releases without any extra configuration. The release assets follow the store layout (`opencode-go-provider_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
 
-Add the registry as an extra store source and reload the config:
+The plugin id was renamed from `opencode-go-cliproxyapi` to `opencode-go-provider` in v0.2.0. The upstream repository `massiveits/opencode-go-cliproxyapi` owns the old id in the official registry, and a registry cannot list the same id twice, so this fork ships under its own id. The provider name `opencode-go` and every model prefix (`opencode-go/glm-5.2`, …) are unchanged; only the plugin identity, the library filename and the `plugins.configs.<id>` key moved.
+
+Upgrading from v0.1.x: rename the `plugins.configs.opencode-go-cliproxyapi` block to `plugins.configs.opencode-go-provider`, replace the installed library with the new one, and remove the now-unused `opencode-go-cliproxyapi-v<version>.<ext>` file from the plugins directory. The plugin's own `registry.json` stays published at `https://raw.githubusercontent.com/xspeed1989/opencode-go-cliproxyapi/main/registry.json` for installs that pin this fork as an extra source:
 
 ```yaml
 plugins:
@@ -206,11 +208,9 @@ plugins:
     - "https://raw.githubusercontent.com/xspeed1989/opencode-go-cliproxyapi/main/registry.json"
 ```
 
-Then open Management Center → Plugin Store and install `opencode-go-cliproxyapi`. The built-in official registry also lists that plugin id for the upstream repository, so when the store asks to choose a source, select the `raw.githubusercontent.com` source.
+The store writes `plugins/<goos>/<goarch>/opencode-go-provider-v<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
 
-The store writes `plugins/<goos>/<goarch>/opencode-go-cliproxyapi_<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
-
-The store resolves each plugin's latest version from the GitHub releases API and caches it per repository for ten minutes, falling back to the `version` field of `registry.json` when that lookup fails. Anonymous GitHub API quota is 60 requests per hour per IP and a single store page load queries every plugin of every enabled registry, so the lookup does fail; that is why `registry.json` carries the current release version. Two consequences for a fresh release: an update can take up to ten minutes to appear, and a row whose version column stays empty got neither the lookup nor the fallback. A plugin installed by hand (not through the store) is also never offered an update while two registries list the same plugin id, because the store cannot verify which source it came from — uninstall it and install it from the `raw.githubusercontent.com` source.
+The store resolves each plugin's latest version from the GitHub releases API and caches it per repository for ten minutes, falling back to the `version` field of `registry.json` when that lookup fails. Anonymous GitHub API quota is 60 requests per hour per IP and a single store page load queries every plugin of every enabled registry, so the lookup does fail; that is why `registry.json` carries the current release version. Two consequences for a fresh release: an update can take up to ten minutes to appear, and a row whose version column stays empty got neither the lookup nor the fallback. A plugin installed by hand (not through the store) is never offered an update, because the store cannot verify which source it came from — uninstall it and install it from the store.
 
 ## Testing
 

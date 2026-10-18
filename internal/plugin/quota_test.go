@@ -152,7 +152,7 @@ func TestQuotaPageIsStaticAndSecretFree(t *testing.T) {
 func TestQuotaPageUsesManualSessionCache(t *testing.T) {
 	page := resources.QuotaPage
 	for _, marker := range []string{
-		`const storageKey = "opencode-go-cliproxyapi:quota"`,
+		`const storageKey = "opencode-go-provider:quota"`,
 		"sessionStorage.getItem(storageKey)",
 		"sessionStorage.setItem(storageKey, JSON.stringify(cache))",
 		"JSON.parse(stored)",
