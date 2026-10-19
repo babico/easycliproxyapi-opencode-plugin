@@ -13,6 +13,7 @@ import (
 type ccRespMessage struct {
 	Content          json.RawMessage     `json:"content"` // JSON string or part array
 	ReasoningContent string              `json:"reasoning_content"`
+	Reasoning        string              `json:"reasoning"`
 	ToolCalls        []shared.CCToolCall `json:"tool_calls"`
 }
 
@@ -194,7 +195,13 @@ func chatToResponses(body []byte) ([]byte, *errclass.Error) {
 	for _, tc := range choice.Message.ToolCalls {
 		oa.AppendFunctionCall(tc.ID, tc.Function.Name, shared.DefaultArgs(tc.Function.Arguments))
 	}
-	if reason := choice.Message.ReasoningContent; reason != "" {
+	// OpenCode upstreams use either field; prefer canonical text when both
+	// are populated instead of replaying the same reasoning twice.
+	reason := choice.Message.ReasoningContent
+	if reason == "" {
+		reason = choice.Message.Reasoning
+	}
+	if reason != "" {
 		out.Output = append(out.Output, shared.ReasoningDoneItem(resp.ID+"-rs", reason))
 	}
 	out.Output = append(out.Output, oa.Render()...)

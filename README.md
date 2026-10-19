@@ -91,16 +91,18 @@ Clients that never stored thinking, and histories whose calls were produced thro
 
 ## Reasoning round-trip
 
-The upstreams this plugin fronts require their chain of thought back once `tools` are in play, and the replayed reasoning is spliced into the model's context. Missing it does not fail loudly: the tool loop simply continues without the earlier plan and intermediate conclusions.
+The upstreams this plugin fronts require their chain of thought back once `tools` are in play, and the replayed reasoning is spliced into the model's context. Missing it can cause an upstream HTTP 400 requiring `reasoning_content`, or let the tool loop continue without the earlier plan and intermediate conclusions.
 
 | Path | Behaviour |
 |---|---|
 | Responses passthrough | Verbatim both ways (native `reasoning` items, plaintext `reasoning_text`) |
 | Chat Completions passthrough | Verbatim both ways (`reasoning_content`) |
-| Chat Completions upstream → Responses client | `reasoning_content` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions; applies to every model that streams the field |
+| Chat Completions upstream → Responses client | `reasoning_content` or `reasoning` becomes a leading reasoning item (`response.reasoning_text.delta` / `.done`), also in non-streaming conversions; applies to every model that returns either field |
 | Responses client → Chat Completions upstream | Replayed reasoning items become `reasoning_content` on every assistant message of their own turn — the text message and the tool-call message a turn may be split into — only for the `deepseek*` family, whose endpoints require the replay |
 | Anthropic `thinking` blocks → Chat Completions upstream | Same `deepseek*`-only rule; `redacted_thinking` stays omitted (encrypted metadata) |
 | Responses upstream → Anthropic client | Not carried: the upstream has no Anthropic `signature` to send |
+
+For Chat Completions → Responses conversion, non-empty `reasoning_content` takes precedence over `reasoning` when both occur in a message or delta; the fields are never concatenated. Text is preserved verbatim, and empty fields do not create placeholder reasoning. Native Chat Completions passthrough remains unchanged. This preserves future replies, but cannot reconstruct reasoning already lost from saved client history.
 
 The client → upstream replay is gated because replaying a field an endpoint never asked for is the only direction that can fail a request; the upstream → client direction is ungated because it only forwards a chain of thought the upstream actually streamed. Extend `reasoningReplayFamilies` in `internal/adapter/chatcompletions/request.go` if another family turns out to need the replay.
 

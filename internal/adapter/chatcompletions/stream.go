@@ -191,6 +191,7 @@ type ccToolCallDelta struct {
 type ccDelta struct {
 	Content          string            `json:"content"`
 	ReasoningContent string            `json:"reasoning_content"`
+	Reasoning        string            `json:"reasoning"`
 	ToolCalls        []ccToolCallDelta `json:"tool_calls"`
 }
 
@@ -451,12 +452,17 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 	}
 	choice := chunk.Choices[0]
 	// Reasoning leads the output: DeepSeek-style upstreams stream the chain
-	// of thought as reasoning_content before any content or tool_calls, and
+	// of thought as reasoning_content or reasoning before content/tool_calls, and
 	// the same upstreams require that reasoning back once tools are in play,
 	// so it must survive the conversion instead of being dropped with the
 	// unknown-field policy. Announce the item before its first delta so
 	// index-pairing clients open the thinking slot in order.
-	if choice.Delta.ReasoningContent != "" {
+	// Match non-stream precedence without duplicating a delta sent in both fields.
+	reason := choice.Delta.ReasoningContent
+	if reason == "" {
+		reason = choice.Delta.Reasoning
+	}
+	if reason != "" {
 		if sc.reasonIdx < 0 {
 			sc.reasonIdx = sc.nextIndex
 			sc.nextIndex++
@@ -466,8 +472,8 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 				"summary": []any{}, "content": []any{},
 			}))
 		}
-		sc.reasoning.WriteString(choice.Delta.ReasoningContent)
-		events = append(events, sc.responsesEm().ReasoningDelta(sc.reasonID, sc.reasonIdx, choice.Delta.ReasoningContent))
+		sc.reasoning.WriteString(reason)
+		events = append(events, sc.responsesEm().ReasoningDelta(sc.reasonID, sc.reasonIdx, reason))
 	}
 	if choice.Delta.Content != "" {
 		if sc.msgIndex < 0 {
