@@ -190,8 +190,8 @@ type ccToolCallDelta struct {
 
 type ccDelta struct {
 	Content          string            `json:"content"`
-	ReasoningContent string            `json:"reasoning_content"`
-	Reasoning        string            `json:"reasoning"`
+	ReasoningContent *string           `json:"reasoning_content"`
+	Reasoning        *string           `json:"reasoning"`
 	ToolCalls        []ccToolCallDelta `json:"tool_calls"`
 }
 
@@ -458,11 +458,8 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 	// unknown-field policy. Announce the item before its first delta so
 	// index-pairing clients open the thinking slot in order.
 	// Match non-stream precedence without duplicating a delta sent in both fields.
-	reason := choice.Delta.ReasoningContent
-	if reason == "" {
-		reason = choice.Delta.Reasoning
-	}
-	if reason != "" {
+	reason := selectReasoning(choice.Delta.ReasoningContent, choice.Delta.Reasoning)
+	if reason != nil {
 		if sc.reasonIdx < 0 {
 			sc.reasonIdx = sc.nextIndex
 			sc.nextIndex++
@@ -472,8 +469,8 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 				"summary": []any{}, "content": []any{},
 			}))
 		}
-		sc.reasoning.WriteString(reason)
-		events = append(events, sc.responsesEm().ReasoningDelta(sc.reasonID, sc.reasonIdx, reason))
+		sc.reasoning.WriteString(*reason)
+		events = append(events, sc.responsesEm().ReasoningDelta(sc.reasonID, sc.reasonIdx, *reason))
 	}
 	if choice.Delta.Content != "" {
 		if sc.msgIndex < 0 {

@@ -832,3 +832,40 @@ func TestParallelFalseNoneStillUnsupported(t *testing.T) { // row 7
 		t.Fatalf("err = %v", eErr)
 	}
 }
+
+func TestResponsesSummaryNullableTextKeepsNewlines(t *testing.T) {
+	for _, tc := range []struct{ summary, want string }{
+		{`[]`, ""}, {`[{"text":""}]`, ""}, {`[{"text":null}]`, ""},
+		{`[{}, {"text":null}, {"text":"plan"}]`, "\n\nplan"},
+		{`[{"text":""}, {}]`, "\n"},
+	} {
+		b, e := BuildRequest("claude", "openai-response", []byte(`{"input":[{"type":"reasoning","summary":`+tc.summary+`},{"role":"assistant","content":"answer"}]}`), nil)
+		if e != nil {
+			t.Fatal(e)
+		}
+		m := decodeReq(t, b)
+		var thoughts []string
+		for _, raw := range m["messages"].([]any) {
+			parts, ok := raw.(map[string]any)["content"].([]any)
+			if !ok {
+				if raw.(map[string]any)["content"] != "answer" {
+					t.Fatal(raw)
+				}
+				continue
+			}
+			for _, part := range parts {
+				p := part.(map[string]any)
+				if p["type"] == "thinking" {
+					thoughts = append(thoughts, p["thinking"].(string))
+				}
+			}
+		}
+		if tc.want == "" {
+			if len(thoughts) != 0 {
+				t.Fatal(thoughts)
+			}
+		} else if len(thoughts) != 1 || thoughts[0] != tc.want {
+			t.Fatal(thoughts)
+		}
+	}
+}

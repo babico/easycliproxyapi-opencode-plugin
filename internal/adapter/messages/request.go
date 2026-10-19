@@ -373,7 +373,9 @@ func fromResponses(upstreamModel string, source *shared.SourceRequest, ts *plugi
 				if i > 0 {
 					sb.WriteString("\n")
 				}
-				sb.WriteString(s.Text)
+				if s.Text != nil {
+					sb.WriteString(*s.Text)
+				}
 			}
 			if sb.Len() > 0 {
 				b.add("assistant", "assistant", anthropicBlock{

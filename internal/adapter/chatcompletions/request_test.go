@@ -1193,3 +1193,106 @@ func assistantMessageOf(t *testing.T, decoded map[string]any) map[string]any {
 	t.Fatalf("no assistant message in %v", decoded["messages"])
 	return nil
 }
+
+func TestResponsesToChatReasoningPresence(t *testing.T) {
+	for _, tc := range []struct {
+		fields, want string
+		present      bool
+	}{
+		{`"content":""`, "", true}, {`"content":[{"text":""}]`, "", true},
+		{`"summary":[{"text":""}]`, "", true}, {`"content":null`, "", false},
+		{`"content":[]`, "", false}, {`"content":[{}]`, "", false},
+		{`"content":[{"text":null}]`, "", false}, {`"content":[null]`, "", false},
+		{`"summary":[]`, "", false}, {`"summary":null`, "", false},
+		{`"summary":[{}, {"text":null},null]`, "", false},
+		{`"encrypted_content":"opaque","summary":[]`, "", false},
+		{`"encrypted_content":"opaque"`, "", false},
+		{`"id":"no-plaintext"`, "", false},
+		{`"content":[{"text":"ok"},{"text":7}]`, "", false},
+		{`"encrypted_content":"opaque","content":[{"text":""}]`, "", true},
+		{`"content":"","summary":[{"text":"sum"}]`, "sum", true},
+		{`"content":[{"text":"a"},{"text":"b"}],"summary":[{"text":"sum"}]`, "ab", true},
+		{`"content":{},"summary":[{"text":"a"},{"text":"b"}]`, "ab", true},
+	} {
+		t.Run(tc.fields, func(t *testing.T) {
+			for _, model := range []string{"deepseek-v4.1-flash", "glm-5.3"} {
+				m := mustBuildModel(t, model, "openai-response", `{"input":[{"type":"reasoning",`+tc.fields+`},{"role":"assistant","content":"comment"},{"type":"function_call","call_id":"a","name":"echo","arguments":"{}"},{"type":"function_call","call_id":"b","name":"echo","arguments":"{}"}]}`, nil)
+				msgs := m["messages"].([]any)
+				if len(msgs) != 2 {
+					t.Fatal(msgs)
+				}
+				for _, raw := range msgs {
+					got, present := reasoningOf(raw.(map[string]any))
+					want := tc.want
+					if model != "deepseek-v4.1-flash" {
+						want = ""
+					}
+					if got != want || present != (tc.present && model == "deepseek-v4.1-flash") {
+						t.Fatalf("%s: %v", model, msgs)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestResponsesToChatEmptyReasoningLifetime(t *testing.T) {
+	for _, first := range []string{`""`, `"old"`} {
+		for _, boundary := range []string{
+			`{"role":"user","content":""}`, `{"role":"system","content":""}`, `{"role":"developer","content":""}`,
+			`{"role":"user","content":"next"}`, `{"role":"system","content":"next"}`, `{"role":"developer","content":"next"}`,
+			`{"type":"function_call_output","call_id":"a","output":"ok"}`,
+			`{"type":"reasoning","encrypted_content":"opaque","summary":[]}`,
+			`{"type":"reasoning","content":""}`, `{"type":"reasoning","content":"new"}`,
+		} {
+			t.Run(first+boundary, func(t *testing.T) {
+				m := mustBuildModel(t, "deepseek-v4.1-flash", "openai-response", `{"input":[{"type":"reasoning","content":`+first+`},{"type":"function_call","call_id":"a","name":"echo"},`+boundary+`,{"type":"function_call","call_id":"b","name":"echo"}]}`, nil)
+				msgs := m["messages"].([]any)
+				var assistants []map[string]any
+				for _, raw := range msgs {
+					msg := raw.(map[string]any)
+					if msg["role"] == "assistant" {
+						assistants = append(assistants, msg)
+					} else if _, ok := msg["reasoning_content"]; ok {
+						t.Fatal(msg)
+					}
+				}
+				if len(assistants) != 2 {
+					t.Fatal(msgs)
+				}
+				var old string
+				json.Unmarshal([]byte(first), &old)
+				if got, ok := reasoningOf(assistants[0]); !ok || got != old {
+					t.Fatal("old carrier mutated", msgs)
+				}
+				want, present := "", false
+				if boundary == `{"type":"reasoning","content":""}` {
+					present = true
+				}
+				if boundary == `{"type":"reasoning","content":"new"}` {
+					want = "new"
+					present = true
+				}
+				if got, ok := reasoningOf(assistants[1]); got != want || ok != present {
+					t.Fatal(msgs)
+				}
+				for i, id := range []string{"a", "b"} {
+					calls := assistants[i]["tool_calls"].([]any)
+					if len(calls) != 1 || calls[0].(map[string]any)["id"] != id {
+						t.Fatal(msgs)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeEmptyReasoningStillOmitted(t *testing.T) {
+	for _, text := range []string{"", "  \n"} {
+		b, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "thinking", "thinking": text}, map[string]any{"type": "text", "text": "answer"}}}}})
+		m := mustBuildModel(t, "deepseek-v4.1-flash", "claude", string(b), nil)
+		if _, ok := m["messages"].([]any)[0].(map[string]any)["reasoning_content"]; ok {
+			t.Fatal(m)
+		}
+	}
+}

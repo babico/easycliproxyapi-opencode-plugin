@@ -133,7 +133,7 @@ type ccContentPart struct {
 type ccMessage struct {
 	Role             string              `json:"role"`
 	Content          any                 `json:"content"` // string, []ccContentPart, or nil
-	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	ReasoningContent *string             `json:"reasoning_content,omitempty"`
 	ToolCalls        []shared.CCToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string              `json:"tool_call_id,omitempty"`
 }
@@ -327,7 +327,7 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord, replayReasoning bool)
 		msg.Content = sb.String()
 	}
 	if r := strings.TrimSpace(reasoning.String()); r != "" {
-		msg.ReasoningContent = r
+		msg.ReasoningContent = &r
 	}
 	if msg.Content == nil && len(msg.ToolCalls) == 0 {
 		return nil, nil
@@ -360,28 +360,40 @@ func carriesReasoningReplay(upstreamModel string) bool {
 // reasoning item: the plaintext reasoning_text parts first (the only part the
 // upstream consumes), then summary texts as a fallback. Content shapes this
 // translator does not model contribute nothing rather than failing the
-// translation: reasoning is context, not a routing decision.
-func reasoningPlainText(item shared.RespItem) string {
+// translation: reasoning is context, not a routing decision. A nonnil result
+// records an actual plaintext string, including an explicitly empty one.
+func reasoningPlainText(item shared.RespItem) *string {
 	var sb strings.Builder
-	if len(item.Content) > 0 && string(item.Content) != "null" {
-		var s string
-		var parts []struct {
-			Text string `json:"text"`
+	present := false
+	appendText := func(text *string) {
+		if text != nil {
+			present = true
+			sb.WriteString(*text)
 		}
-		if err := json.Unmarshal(item.Content, &s); err == nil {
-			sb.WriteString(s)
+	}
+	if len(item.Content) > 0 {
+		var text *string
+		var parts []struct {
+			Text *string `json:"text"`
+		}
+		if err := json.Unmarshal(item.Content, &text); err == nil {
+			appendText(text)
 		} else if err := json.Unmarshal(item.Content, &parts); err == nil {
-			for _, p := range parts {
-				sb.WriteString(p.Text)
+			for _, part := range parts {
+				appendText(part.Text)
 			}
 		}
 	}
 	if sb.Len() == 0 {
-		for _, s := range item.Summary {
-			sb.WriteString(s.Text)
+		for _, summary := range item.Summary {
+			appendText(summary.Text)
 		}
 	}
-	return sb.String()
+	if !present {
+		return nil
+	}
+	text := sb.String()
+	return &text
 }
 
 // ---- openai-response (Responses) -> Chat Completions (FR-005) ----
@@ -448,7 +460,8 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 	// into a later turn. Only the families whose endpoints require the chain of
 	// thought back ever get it attached.
 	replayReasoning := carriesReasoningReplay(upstreamModel)
-	turnReasoning := ""
+	// Carriers are immutable: advancing turns must not change earlier messages.
+	var turnReasoning *string
 	// mergeToolCalls records whether the trailing tool-call message may absorb
 	// the calls that follow it: a fresh reasoning item opens a new assistant
 	// output, whose calls carry the new chain of thought in their own message.
@@ -466,7 +479,7 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 			switch item.Role {
 			case "system", "developer":
 				// A system/developer message starts a new turn.
-				turnReasoning = ""
+				turnReasoning = nil
 				// Flatten to text; images have no system-message
 				// equivalent and are rejected descriptively (FR-005).
 				text := ""
@@ -492,7 +505,7 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 					out.Messages = append(out.Messages, msg)
 				}
 				if item.Role == "user" {
-					turnReasoning = ""
+					turnReasoning = nil
 				}
 			default:
 				return nil, shared.ValidateRole(item.Role, EndpointPath)
@@ -504,10 +517,11 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 			// Merge consecutive function_call items into one
 			// assistant message so multi-call turns round-trip. A call that
 			// follows a fresh reasoning item belongs to that new output
-			// instead of extending the tool-call message before it.
+			// instead of extending the tool-call message before it. Carrier identity
+			// also isolates dropped empty boundaries while preserving nil/nil merges.
 			if n := len(out.Messages); n > 0 {
 				last := &out.Messages[n-1]
-				if mergeToolCalls && last.Role == "assistant" && last.Content == nil {
+				if mergeToolCalls && last.Role == "assistant" && last.Content == nil && last.ReasoningContent == turnReasoning {
 					last.ToolCalls = append(last.ToolCalls, tc)
 					continue
 				}
@@ -519,7 +533,7 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 		case "function_call_output":
 			// The tool result closes the assistant turn the replayed
 			// reasoning belonged to.
-			turnReasoning = ""
+			turnReasoning = nil
 			out.Messages = append(out.Messages, ccMessage{
 				Role: "tool", Content: item.Output, ToolCallID: item.CallID,
 			})

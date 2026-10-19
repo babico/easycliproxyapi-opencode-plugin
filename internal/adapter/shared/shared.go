@@ -1014,7 +1014,7 @@ type RespItem struct {
 	Arguments string          `json:"arguments,omitempty"`
 	Output    string          `json:"output,omitempty"`
 	Summary   []struct {
-		Text string `json:"text"`
+		Text *string `json:"text"`
 	} `json:"summary,omitempty"`
 }
 

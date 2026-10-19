@@ -12,8 +12,8 @@ import (
 
 type ccRespMessage struct {
 	Content          json.RawMessage     `json:"content"` // JSON string or part array
-	ReasoningContent string              `json:"reasoning_content"`
-	Reasoning        string              `json:"reasoning"`
+	ReasoningContent *string             `json:"reasoning_content"`
+	Reasoning        *string             `json:"reasoning"`
 	ToolCalls        []shared.CCToolCall `json:"tool_calls"`
 }
 
@@ -197,12 +197,9 @@ func chatToResponses(body []byte) ([]byte, *errclass.Error) {
 	}
 	// OpenCode upstreams use either field; prefer canonical text when both
 	// are populated instead of replaying the same reasoning twice.
-	reason := choice.Message.ReasoningContent
-	if reason == "" {
-		reason = choice.Message.Reasoning
-	}
-	if reason != "" {
-		out.Output = append(out.Output, shared.ReasoningDoneItem(resp.ID+"-rs", reason))
+	reason := selectReasoning(choice.Message.ReasoningContent, choice.Message.Reasoning)
+	if reason != nil {
+		out.Output = append(out.Output, shared.ReasoningDoneItem(resp.ID+"-rs", *reason))
 	}
 	out.Output = append(out.Output, oa.Render()...)
 	if resp.Usage != nil {
@@ -217,4 +214,19 @@ func chatToResponses(body []byte) ([]byte, *errclass.Error) {
 	}
 	b, _ := json.Marshal(out) // only marshallable composed types; cannot fail
 	return b, nil
+}
+
+// selectReasoning prefers nonempty text, then preserves explicit empty presence.
+// Selection is per message/delta; neither spelling is trimmed or concatenated.
+func selectReasoning(canonical, alternate *string) *string {
+	if canonical != nil && *canonical != "" {
+		return canonical
+	}
+	if alternate != nil && *alternate != "" {
+		return alternate
+	}
+	if canonical != nil {
+		return canonical
+	}
+	return alternate
 }
