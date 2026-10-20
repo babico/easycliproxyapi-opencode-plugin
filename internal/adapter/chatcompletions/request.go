@@ -6,6 +6,7 @@ package chatcompletions
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -121,7 +122,8 @@ func isValidThinking(raw json.RawMessage) bool {
 }
 
 type imageURLField struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type ccContentPart struct {
@@ -469,7 +471,22 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 	// releases — a trailing assistant message without content absorbs the calls
 	// that follow it.
 	mergeToolCalls := false
+	// Chat tool messages accept text only. Keep all untrusted text in its
+	// tool role and link image positions with generated numeric markers.
+	// Defer images until the consecutive tool results are complete, since
+	// inserting a user message between parallel results breaks tool replay.
+	var toolImages []ccContentPart
+	imageSeq := 0
+	flushToolImages := func() {
+		if len(toolImages) > 0 {
+			out.Messages = append(out.Messages, ccMessage{Role: "user", Content: toolImages})
+			toolImages = nil
+		}
+	}
 	for _, item := range items {
+		if item.Type != "function_call_output" {
+			flushToolImages()
+		}
 		switch item.Type {
 		case "message":
 			content, eErr := respContent(item.Content)
@@ -534,8 +551,26 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 			// The tool result closes the assistant turn the replayed
 			// reasoning belonged to.
 			turnReasoning = nil
+			parts, eErr := shared.DecodeStringOrParts(item.Output, EndpointPath)
+			if eErr != nil {
+				return nil, eErr
+			}
+			var text strings.Builder
+			for _, part := range parts {
+				if part.ImageURL == "" {
+					text.WriteString(part.Text)
+					continue
+				}
+				imageSeq++
+				marker := fmt.Sprintf("[tool image %d]", imageSeq)
+				text.WriteString(marker)
+				toolImages = append(toolImages,
+					ccContentPart{Type: "text", Text: marker},
+					ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: part.ImageURL, Detail: part.Detail}},
+				)
+			}
 			out.Messages = append(out.Messages, ccMessage{
-				Role: "tool", Content: item.Output, ToolCallID: item.CallID,
+				Role: "tool", Content: text.String(), ToolCallID: item.CallID,
 			})
 		case "reasoning":
 			if replayReasoning {
@@ -547,6 +582,8 @@ func responsesToChat(upstreamModel string, source *shared.SourceRequest, _ *plug
 			return nil, shared.UnsupportedInputItemType(item.Type)
 		}
 	}
+
+	flushToolImages()
 
 	for _, t := range src.Tools {
 		if eErr := shared.FunctionTool(t.Type, EndpointPath); eErr != nil {
@@ -580,7 +617,7 @@ func respContent(raw json.RawMessage) (any, *errclass.Error) {
 	out := make([]ccContentPart, 0, len(parts))
 	for _, p := range parts {
 		if p.ImageURL != "" {
-			out = append(out, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: p.ImageURL}})
+			out = append(out, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: p.ImageURL, Detail: p.Detail}})
 			continue
 		}
 		out = append(out, ccContentPart{Type: "text", Text: p.Text})

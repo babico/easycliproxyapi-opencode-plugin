@@ -1003,7 +1003,8 @@ func (r *ResponsesRequest) DecodeInputItems() ([]RespItem, *errclass.Error) {
 // terminal message items (FR-006 sibling parity: the Chat Completions
 // and Messages routes emit the same "id" the streaming
 // response.output_item.added announcement used); function_call items stay
-// call_id-only per the documented canonical shape.
+// call_id-only per the documented canonical shape. Output stays raw until
+// the target converter decodes its string-or-content-array union.
 type RespItem struct {
 	Type      string          `json:"type"`
 	ID        string          `json:"id,omitempty"`
@@ -1012,7 +1013,7 @@ type RespItem struct {
 	CallID    string          `json:"call_id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Arguments string          `json:"arguments,omitempty"`
-	Output    string          `json:"output,omitempty"`
+	Output    json.RawMessage `json:"output,omitempty"`
 	Summary   []struct {
 		Text *string `json:"text"`
 	} `json:"summary,omitempty"`
@@ -1085,6 +1086,7 @@ func JoinTexts(parts []map[string]any) string {
 type ContentPart struct {
 	Text     string
 	ImageURL string // resolved image URL; empty for text parts
+	Detail   string // optional Responses image detail hint
 }
 
 // DecodeStringOrParts is THE shared string-or-parts kernel owning the
@@ -1111,6 +1113,7 @@ func DecodeStringOrParts(raw json.RawMessage, targetLabel string) ([]ContentPart
 		Type     string          `json:"type"`
 		Text     string          `json:"text"`
 		ImageURL json.RawMessage `json:"image_url"`
+		Detail   string          `json:"detail"`
 	}
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil, errclass.Translation("malformed message content: " + err.Error())
@@ -1125,7 +1128,7 @@ func DecodeStringOrParts(raw json.RawMessage, targetLabel string) ([]ContentPart
 			if eErr != nil {
 				return nil, eErr
 			}
-			out = append(out, ContentPart{ImageURL: url})
+			out = append(out, ContentPart{ImageURL: url, Detail: p.Detail})
 			continue
 		}
 		if p.Text != "" { // uniform DROP policy: no dead text parts upstream

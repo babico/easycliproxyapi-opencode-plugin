@@ -361,8 +361,16 @@ func fromResponses(upstreamModel string, source *shared.SourceRequest, ts *plugi
 				"type": "tool_use", "id": item.CallID, "name": item.Name, "input": input,
 			})
 		case "function_call_output":
+			blocks, eErr := contentParts(item.Output)
+			if eErr != nil {
+				return nil, eErr
+			}
+			content := any(shared.JoinTexts(blocks))
+			if hasImage(blocks) {
+				content = blocks // preserve images inside the associated tool result
+			}
 			b.add("user:tool", "user", anthropicBlock{
-				"type": "tool_result", "tool_use_id": item.CallID, "content": item.Output,
+				"type": "tool_result", "tool_use_id": item.CallID, "content": content,
 			})
 		case "reasoning":
 			// Best-effort: keep summary text as a thinking block;
