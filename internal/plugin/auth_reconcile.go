@@ -15,7 +15,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"opencode-go-cliproxyapi/internal/config"
+	"easycliproxyapi-opencode-plugin/internal/config"
 )
 
 // managedAuthPrefix marks the auth records this plugin materializes from

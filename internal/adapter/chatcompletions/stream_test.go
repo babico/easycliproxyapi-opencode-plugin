@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"opencode-go-cliproxyapi/internal/errclass"
+	"easycliproxyapi-opencode-plugin/internal/errclass"
 )
 
 type sseEvt struct {

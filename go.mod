@@ -1,4 +1,4 @@
-module opencode-go-cliproxyapi
+module easycliproxyapi-opencode-plugin
 
 go 1.26.7
 

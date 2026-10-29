@@ -10,8 +10,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"opencode-go-cliproxyapi/internal/config"
-	"opencode-go-cliproxyapi/resources"
+	"easycliproxyapi-opencode-plugin/internal/config"
+	"easycliproxyapi-opencode-plugin/resources"
 )
 
 func TestManagementRegistration(t *testing.T) {

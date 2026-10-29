@@ -3,7 +3,7 @@ package shared
 import (
 	"encoding/json"
 
-	"opencode-go-cliproxyapi/internal/errclass"
+	"easycliproxyapi-opencode-plugin/internal/errclass"
 )
 
 // cacheSlot memoizes one lazy decode for the lifetime of a SourceRequest:

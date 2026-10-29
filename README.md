@@ -1,4 +1,4 @@
-# OpenCode Go CLIProxyAPI Plugin
+# EasyCLIProxyAPI OpenCode Plugin (babico fork)
 
 A native dynamic Go plugin for [CLIProxyAPI](https://help.router-for.me/plugin/development) that exposes OpenCode Go as a single provider (`opencode-go`).
 

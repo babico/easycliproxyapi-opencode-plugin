@@ -11,9 +11,9 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
-	"opencode-go-cliproxyapi/internal/catalog"
-	"opencode-go-cliproxyapi/internal/config"
-	"opencode-go-cliproxyapi/internal/errclass"
+	"easycliproxyapi-opencode-plugin/internal/catalog"
+	"easycliproxyapi-opencode-plugin/internal/config"
+	"easycliproxyapi-opencode-plugin/internal/errclass"
 )
 
 // ProviderID is the single provider key served by this plugin (FR-001).
@@ -22,12 +22,12 @@ const ProviderID = "opencode-go"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "opencode-go-provider"
-	pluginVersion = "1.0.3"
+	pluginVersion = "1.1.0"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
 // validPlugin rejects empty Metadata.GitHubRepository).
-const githubRepoURL = "https://github.com/xspeed1989/opencode-go-cliproxyapi"
+const githubRepoURL = "https://github.com/babico/easycliproxyapi-opencode-plugin"
 
 // registerRefreshTimeout bounds ONLY the synchronous initial/reconfigure
 // refreshOnce so a slow catalog cannot block host startup/reconfigure for a
@@ -228,7 +228,7 @@ func registrationEnvelope() []byte {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
-			Author:           pluginName,
+			Author:           "babico",
 			GitHubRepository: githubRepoURL,
 			ConfigFields:     pluginConfigFields(),
 		},

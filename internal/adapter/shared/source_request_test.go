@@ -3,7 +3,7 @@ package shared
 import (
 	"testing"
 
-	"opencode-go-cliproxyapi/internal/errclass"
+	"easycliproxyapi-opencode-plugin/internal/errclass"
 )
 
 // TestCacheSlotDecodeRunsOnce proves the memoizing helper underlying every

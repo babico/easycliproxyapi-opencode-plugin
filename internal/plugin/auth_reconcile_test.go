@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"opencode-go-cliproxyapi/internal/config"
+	"easycliproxyapi-opencode-plugin/internal/config"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
