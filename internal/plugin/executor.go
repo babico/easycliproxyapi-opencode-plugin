@@ -42,9 +42,11 @@ type executorRequest struct {
 // resolvedExecution carries everything both execution paths need after
 // model/key resolution succeeded.
 type resolvedExecution struct {
-	cfg config.Config
-	rec catalog.ModelRecord
-	key string
+	cfg     config.Config
+	rec     catalog.ModelRecord
+	key     string
+	baseURL string // credential Attributes["base_url"] override (OAuth -> inference/go)
+	orgID   string // credential Attributes["org_id"] (x-opencode-org-id header)
 }
 
 // resolveExecution resolves the requested model against the snapshot and
@@ -58,7 +60,9 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 		return nil, classEnvelope(&errclass.Error{Class: errclass.ClassAuth, Message: "selected auth provider is not opencode-go"})
 	}
 	key := strings.TrimSpace(req.AuthAttributes["api_key"])
-	debugTrace("executor auth model=%s auth_id=%s provider=%s attr_api_key_present=%t attr_count=%d storage_json_bytes=%d", req.Model, req.AuthID, req.AuthProvider, key != "", len(req.AuthAttributes), len(req.StorageJSON))
+	baseURL := strings.TrimSpace(req.AuthAttributes["base_url"])
+	orgID := strings.TrimSpace(req.AuthAttributes["org_id"])
+	debugTrace("executor auth model=%s auth_id=%s provider=%s attr_api_key_present=%t base_url_override=%t org_id_present=%t storage_json_bytes=%d", req.Model, req.AuthID, req.AuthProvider, key != "", baseURL != "", orgID != "", len(req.StorageJSON))
 	if key == "" {
 		return nil, classEnvelope(&errclass.Error{Class: errclass.ClassAuth, Message: "selected auth has no api key"})
 	}
@@ -74,7 +78,16 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 			StatusCode: http.StatusNotFound,
 		})
 	}
-	return &resolvedExecution{cfg: cfg, rec: rec, key: key}, nil
+	return &resolvedExecution{cfg: cfg, rec: rec, key: key, baseURL: baseURL, orgID: orgID}, nil
+}
+
+// effectiveBaseURL returns the per-credential override when set (OAuth
+// credentials route to inference/go), otherwise the configured zen/go base.
+func (r *resolvedExecution) effectiveBaseURL() string {
+	if r.baseURL != "" {
+		return r.baseURL
+	}
+	return r.cfg.BaseURL
 }
 
 // handleExecute implements executor.execute (non-stream). Stream-flagged
@@ -103,7 +116,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 		return classEnvelope(eErr), nil
 	}
 
-	url := catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	url := catalog.JoinUpstreamURL(res.effectiveBaseURL(), res.rec.EndpointPath)
 	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s key_count=%d", req.Model, res.rec.UpstreamID, res.rec.Protocol, url, len(res.cfg.APIKeys))
 	debugTrace("executor sending non-stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
@@ -111,7 +124,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID, res.orgID),
 		Body:    upstreamBody,
 	})
 	if err != nil {
@@ -156,7 +169,7 @@ func buildUpstreamRequestFrom(route catalog.Route, upstreamModel string, source 
 	return nil, errclass.Translation("unsupported route")
 }
 
-func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header {
+func upstreamAuthHeaders(route catalog.Route, key, sessionID, orgID string) http.Header {
 	var h http.Header
 	if route == catalog.RouteMessages {
 		h = messages.AuthHeaders(key)
@@ -165,6 +178,9 @@ func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header
 		h = chatcompletions.AuthHeaders(key)
 	}
 	h.Set("x-opencode-session", sessionID)
+	if orgID != "" {
+		h.Set("x-opencode-org-id", orgID)
+	}
 	return h
 }
 
@@ -429,14 +445,14 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		return classEnvelope(eErr), nil
 	}
 
-	url := catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	url := catalog.JoinUpstreamURL(res.effectiveBaseURL(), res.rec.EndpointPath)
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
 	st, _, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID, res.orgID),
 		Body:    upstreamBody,
 	})
 	debugTrace("executor stream DoStream status=%d upstreamID=%s err=%v", st, id, err)

@@ -20,6 +20,15 @@ const (
 	DefaultRefreshInterval  = 15 * time.Minute
 	DefaultRequestTimeout   = 5 * time.Minute
 	DefaultMaxResponseBytes = int64(67108864) // 64 MiB
+
+	// OAuth device-login defaults (console + inference endpoints). API-key
+	// credentials route to BaseURL (zen/go/v1); OAuth tokens use
+	// InferenceBaseURL so both upstream families are supported.
+	DefaultConsoleURL        = "https://opencode.ai/console"
+	DefaultOAuthClientID     = "opencode-cli"
+	DefaultUserAgent         = "opencode/1.19.5" // anomalyco/opencode en yeni release (2026-10-28)
+	DefaultSessionID         = "cpa-main"
+	DefaultInferenceBaseURL  = "https://opencode.ai/inference/go"
 )
 
 type ModelPrefix struct {
@@ -58,6 +67,13 @@ type Config struct {
 	AllowHTTP        bool
 	RequestTimeout   time.Duration
 	MaxResponseBytes int64
+
+	// OAuth / login
+	ConsoleURL        string
+	OAuthClientID     string
+	UserAgent         string
+	SessionID         string
+	InferenceBaseURL  string
 }
 
 // rawConfig mirrors the YAML shape; pointer fields distinguish "unset"
@@ -74,6 +90,12 @@ type rawConfig struct {
 	AllowHTTP        bool                     `yaml:"allow-http"`
 	RequestTimeout   *string                  `yaml:"request-timeout"`
 	MaxResponseBytes *int64                   `yaml:"max-response-bytes"`
+
+	ConsoleURL        *string `yaml:"console-url"`
+	OAuthClientID     *string `yaml:"oauth-client-id"`
+	UserAgent         *string `yaml:"user-agent"`
+	SessionID         *string `yaml:"session-id"`
+	InferenceBaseURL  *string `yaml:"inference-base-url"`
 }
 
 type rawPrefix struct {
@@ -147,6 +169,12 @@ func Load(yamlBytes []byte) (Config, error) {
 		AllowHTTP:        raw.AllowHTTP,
 		RequestTimeout:   requestTimeout,
 		MaxResponseBytes: orDefault(raw.MaxResponseBytes, DefaultMaxResponseBytes),
+
+		ConsoleURL:       orDefault(raw.ConsoleURL, DefaultConsoleURL),
+		OAuthClientID:    orDefault(raw.OAuthClientID, DefaultOAuthClientID),
+		UserAgent:        orDefault(raw.UserAgent, DefaultUserAgent),
+		SessionID:        orDefault(raw.SessionID, DefaultSessionID),
+		InferenceBaseURL: orDefault(raw.InferenceBaseURL, DefaultInferenceBaseURL),
 	}
 	if raw.CatalogURL != nil {
 		// Mirror the derived-default trim so an explicit trailing-slash

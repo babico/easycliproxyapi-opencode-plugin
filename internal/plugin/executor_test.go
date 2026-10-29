@@ -1376,8 +1376,11 @@ func TestConvertNonStreamSeamBranches(t *testing.T) {
 	if got := catalog.JoinUpstreamURL("https://gw.test/", "/v1/responses"); got != "https://gw.test/responses" {
 		t.Fatalf("url join = %q", got)
 	}
-	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", "session"); got.Get("Authorization") != "Bearer k" || got.Get("x-opencode-session") != "session" {
+	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", "session", ""); got.Get("Authorization") != "Bearer k" || got.Get("x-opencode-session") != "session" || got.Get("x-opencode-org-id") != "" {
 		t.Fatalf("bearer headers = %v", got)
+	}
+	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", "session", "org-123"); got.Get("x-opencode-org-id") != "org-123" {
+		t.Fatalf("org header = %v", got)
 	}
 	// Adapters own status classification uniformly (§7).
 	if _, eErr := convertNonStream(catalog.RouteMessages, "claude", http.StatusServiceUnavailable, []byte("upstream down")); eErr == nil ||

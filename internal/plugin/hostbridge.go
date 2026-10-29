@@ -60,10 +60,11 @@ func (e *hostCallTimeoutError) Error() string { return "host call " + e.method +
 
 // hostHTTPReq is the wire shape accepted by host.http.do / do_stream.
 type hostHTTPReq struct {
-	Method  string      `json:"method"`
-	URL     string      `json:"url"`
-	Headers http.Header `json:"headers"`
-	Body    []byte      `json:"body"`
+	Method         string      `json:"method"`
+	URL            string      `json:"url"`
+	Headers        http.Header `json:"headers"`
+	Body           []byte      `json:"body"`
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
 }
 
 type hostAuthListResponse struct {
@@ -389,6 +390,23 @@ func (b *HostBridge) invoke(ctx context.Context, method string, payload any, wha
 func (b *HostBridge) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	env, err := b.invoke(ctx, pluginabi.MethodHostHTTPDo, hostHTTPReq{
 		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body,
+	}, "host http do")
+	if err != nil {
+		return pluginapi.HTTPResponse{}, err
+	}
+	var resp pluginapi.HTTPResponse
+	if len(env.Result) > 0 && json.Unmarshal(env.Result, &resp) != nil {
+		return pluginapi.HTTPResponse{}, fmt.Errorf("host http do failed: undecodable response body")
+	}
+	return resp, nil
+}
+
+// DoCallback is Do, carrying the host_callback_id from the RPC envelope so the
+// host attributes the request to the login/refresh session (used by the OAuth
+// device flow; empty id falls back to plain Do semantics).
+func (b *HostBridge) DoCallback(ctx context.Context, hostCallbackID string, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	env, err := b.invoke(ctx, pluginabi.MethodHostHTTPDo, hostHTTPReq{
+		Method: req.Method, URL: req.URL, Headers: req.Headers, Body: req.Body, HostCallbackID: hostCallbackID,
 	}, "host http do")
 	if err != nil {
 		return pluginapi.HTTPResponse{}, err

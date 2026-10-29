@@ -11,51 +11,33 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"easycliproxyapi-opencode-plugin/internal/config"
-	"easycliproxyapi-opencode-plugin/resources"
 )
 
-func TestManagementRegistration(t *testing.T) {
+func TestQuotaProviderCapability(t *testing.T) {
 	m := NewManager(nil)
-	var got struct {
-		Routes    []struct{ Method, Path string }            `json:"routes"`
-		Resources []struct{ Path, Menu, Description string } `json:"resources"`
-	}
-	decodeResult(t, mustHandle(t, m, pluginabi.MethodManagementRegister, []byte(`{}`)), &got)
-	if len(got.Routes) != 1 || got.Routes[0].Method != http.MethodPost || got.Routes[0].Path != "/plugins/"+pluginName+"/quota-usage" {
-		t.Fatalf("routes = %+v", got.Routes)
-	}
-	if len(got.Resources) != 1 || got.Resources[0].Path != "/quota" || got.Resources[0].Menu != "OpenCode Go Quota" {
-		t.Fatalf("resources = %+v", got.Resources)
-	}
-	var registration registrationResult
-	decodeResult(t, mustHandle(t, m, pluginabi.MethodPluginRegister, lifecycleRequestBody(testValidYAML)), &registration)
-	if !registration.Capabilities.ManagementAPI {
-		t.Fatal("registration did not advertise management_api")
+	var reg registrationResult
+	decodeResult(t, mustHandle(t, m, pluginabi.MethodPluginRegister, lifecycleRequestBody(testValidYAML)), &reg)
+	if !reg.Capabilities.QuotaProvider {
+		t.Fatal("registration did not advertise quota_provider")
 	}
 }
 
-func TestQuotaListDoesNotCallHost(t *testing.T) {
-	f := &fakeCaller{}
-	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{APIKeys: []config.APIKey{{Value: "quota-key-a"}, {Value: "quota-key-b"}}}
-	var got quotaList
-	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{}`)})
+func TestQuotaDescribe(t *testing.T) {
+	m := NewManager(nil)
+	got, err := (quotaProvider{m}).DescribeQuota(context.Background(), pluginapi.QuotaDescribeRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(resp.Body, &got); err != nil {
-		t.Fatal(err)
+	if len(got.SupportedProviders) != 1 || got.SupportedProviders[0] != ProviderID {
+		t.Fatalf("SupportedProviders = %+v", got.SupportedProviders)
 	}
-	if len(got.Cards) != 2 || got.Cards[0].Label != "OpenCode Go credential "+mustHashPrefix("quota-key-a") || got.Cards[1].Label != "OpenCode Go credential "+mustHashPrefix("quota-key-b") {
-		t.Fatalf("cards = %+v", got.Cards)
-	}
-	if strings.Contains(string(resp.Body), "quota-key-") || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
-		t.Fatalf("list leaked key or called upstream: %s calls=%v", resp.Body, f.callsOf(pluginabi.MethodHostHTTPDo))
+	if got.DisplayName != "OpenCode Go" || got.SupportsReset {
+		t.Fatalf("describe = %+v", got)
 	}
 }
 
-func TestQuotaRefresh(t *testing.T) {
-	const key = "quota-refresh-secret"
+func TestQuotaFetchFromAttribute(t *testing.T) {
+	const key = "quota-fetch-secret"
 	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
 		if method != pluginabi.MethodHostHTTPDo {
 			return hostOK(map[string]any{}), nil
@@ -65,60 +47,100 @@ func TestQuotaRefresh(t *testing.T) {
 			URL     string      `json:"url"`
 			Headers http.Header `json:"headers"`
 		}
-		if err := json.Unmarshal(payload, &wire); err != nil || wire.Method != http.MethodGet || wire.URL != "https://quota.test/v1/usage" || wire.Headers.Get("Authorization") != "Bearer "+key || wire.Headers.Get("Accept") != "application/json" {
+		if err := json.Unmarshal(payload, &wire); err != nil || wire.Method != http.MethodGet ||
+			wire.URL != "https://quota.test/v1/usage" ||
+			wire.Headers.Get("Authorization") != "Bearer "+key ||
+			wire.Headers.Get("Accept") != "application/json" {
 			t.Fatalf("bad quota request: %s", payload)
 		}
 		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"usage":{"rolling":{"status":"ok","percent":9,"resetsAt":"2026-09-05T12:20:04Z"},"weekly":{"status":"ok","percent":12,"resetsAt":"2026-09-10T00:00:00Z"},"monthly":{"status":"ok","percent":6,"resetsAt":"2026-10-01T00:00:00Z"}}}`)}), nil
 	}}
 	m := NewManager(NewHostBridge(f.call))
 	m.cfg = config.Config{BaseURL: "https://quota.test/v1/", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
-	id, _ := quotaIdentity(key)
-	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
+
+	req := pluginapi.QuotaFetchRequest{AuthID: authRecordID(key), Provider: ProviderID, Attributes: map[string]string{"api_key": key}}
+	resp, err := (quotaProvider{m}).FetchQuota(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got quotaCard
-	if err := json.Unmarshal(resp.Body, &got); err != nil {
+	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 3 {
+		t.Fatalf("groups = %+v", resp.Groups)
+	}
+	b := resp.Groups[0].Buckets
+	// remainingFraction = 1 - percent/100
+	if want := 0.91; b[0].Window != "5h" || absF(b[0].RemainingFraction-want) > 1e-9 || b[0].ResetTime != "2026-09-05T12:20:04Z" {
+		t.Fatalf("rolling bucket = %+v", b[0])
+	}
+	if b[1].Window != "weekly" || absF(b[1].RemainingFraction-0.88) > 1e-9 {
+		t.Fatalf("weekly bucket = %+v", b[1])
+	}
+	if b[2].Window != "monthly" || absF(b[2].RemainingFraction-0.94) > 1e-9 {
+		t.Fatalf("monthly bucket = %+v", b[2])
+	}
+	if resp.Subscription == nil || resp.Subscription.Plan != "go" {
+		t.Fatalf("subscription = %+v", resp.Subscription)
+	}
+}
+
+func TestQuotaFetchResolvesConfigPoolByAuthID(t *testing.T) {
+	const key = "pool-resolve-secret"
+	f := &fakeCaller{responder: func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"x"},"weekly":{"status":"ok","percent":0,"resetsAt":"x"},"monthly":{"status":"ok","percent":0,"resetsAt":"x"}}}`)}), nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{BaseURL: "https://quota.test/v1", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
+	// Attributes/StorageJSON bos; AuthID ile config pool'dan esles
+	resp, err := (quotaProvider{m}).FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{AuthID: authRecordID(key), Provider: ProviderID})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Usage == nil || got.Usage.Rolling.Percent != 9 || got.Usage.Weekly.ResetsAt != "2026-09-10T00:00:00Z" || got.Usage.Monthly.Percent != 6 {
-		t.Fatalf("usage = %+v", got.Usage)
+	if len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 1 || len(resp.Groups) != 1 {
+		t.Fatalf("calls=%v groups=%+v", f.callsOf(pluginabi.MethodHostHTTPDo), resp.Groups)
 	}
 }
 
-func TestQuotaUnknownKeyAndResource(t *testing.T) {
-	const key = "quota-known-secret"
+func TestQuotaFetchFromStorage(t *testing.T) {
+	const key = "storage-secret"
+	f := &fakeCaller{responder: func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"usage":{"rolling":{"status":"ok","percent":1,"resetsAt":"x"},"weekly":{"status":"ok","percent":1,"resetsAt":"x"},"monthly":{"status":"ok","percent":1,"resetsAt":"x"}}}`)}), nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{BaseURL: "https://quota.test/v1", RequestTimeout: config.DefaultRequestTimeout}
+	// StorageJSON'dan api_key cikar
+	resp, err := (quotaProvider{m}).FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{Provider: ProviderID, StorageJSON: []byte(`{"type":"opencode-go","api_key":"` + key + `"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 1 || len(resp.Groups) != 1 {
+		t.Fatalf("calls=%v", f.callsOf(pluginabi.MethodHostHTTPDo))
+	}
+}
+
+func TestQuotaFetchNoCredential(t *testing.T) {
 	f := &fakeCaller{}
 	m := NewManager(NewHostBridge(f.call))
-	m.cfg = config.Config{APIKeys: []config.APIKey{{Value: key}}}
-	unknown := "opencode-go-key-unknown"
-	resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + unknown + `"}`)})
-	if err != nil || resp.StatusCode != http.StatusNotFound || strings.Contains(string(resp.Body), key) || strings.Contains(string(resp.Body), unknown) || len(f.callsOf(pluginabi.MethodHostHTTPDo)) != 0 {
-		t.Fatalf("unknown response = %+v err=%v calls=%v", resp, err, f.callsOf(pluginabi.MethodHostHTTPDo))
-	}
-	resource, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/" + pluginName + "/quota"})
-	if err != nil || resource.StatusCode != 0 || resource.Headers.Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(string(resource.Body), "OpenCode Go Quota") || strings.Contains(string(resource.Body), key) {
-		t.Fatalf("resource response = %+v err=%v", resource, err)
+	m.cfg = config.Config{BaseURL: "https://quota.test/v1", RequestTimeout: config.DefaultRequestTimeout}
+	if _, err := (quotaProvider{m}).FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{Provider: ProviderID}); err == nil || !strings.Contains(err.Error(), "no opencode-go credential") {
+		t.Fatalf("expected no-credential error, got %v", err)
 	}
 }
 
-func TestQuotaPageReadsRememberedManagementKey(t *testing.T) {
-	if !strings.Contains(resources.QuotaPage, "parsed.state && parsed.state.managementKey") {
-		t.Fatal("quota page does not read persisted state.managementKey")
-	}
-}
-
-func TestQuotaPageDecodesCurrentCPAAuthStorage(t *testing.T) {
-	for _, marker := range []string{"enc::v1::", "cli-proxy-api-webui::secure-storage", "TextDecoder"} {
-		if !strings.Contains(resources.QuotaPage, marker) {
-			t.Fatalf("quota page does not decode current CPA auth storage: missing %q", marker)
-		}
+func TestQuotaResetUnsupported(t *testing.T) {
+	m := NewManager(nil)
+	resp, err := (quotaProvider{m}).ResetQuota(context.Background(), pluginapi.QuotaResetRequest{Provider: ProviderID})
+	if err != nil || resp.Success {
+		t.Fatalf("reset = %+v err=%v (must be unsupported)", resp, err)
 	}
 }
 
 func TestQuotaErrorsAreRedacted(t *testing.T) {
 	const key = "quota-error-secret"
-	id, _ := quotaIdentity(key)
 	for name, responder := range map[string]func(string, []byte) ([]byte, error){
 		"bridge": func(string, []byte) ([]byte, error) { return nil, context.Canceled },
 		"status": func(string, []byte) ([]byte, error) {
@@ -132,102 +154,28 @@ func TestQuotaErrorsAreRedacted(t *testing.T) {
 			f := &fakeCaller{responder: responder}
 			m := NewManager(NewHostBridge(f.call))
 			m.cfg = config.Config{BaseURL: "https://quota.test/v1", RequestTimeout: config.DefaultRequestTimeout, APIKeys: []config.APIKey{{Value: key}}}
-			resp, err := m.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodPost, Path: "/v0/management/plugins/" + pluginName + "/quota-usage", Body: []byte(`{"key_id":"` + id + `"}`)})
-			if err != nil || resp.StatusCode != http.StatusBadGateway || strings.Contains(string(resp.Body), key) || strings.Contains(string(resp.Body), "upstream body") {
-				t.Fatalf("response = %+v err=%v", resp, err)
+			_, err := (quotaProvider{m}).FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{Provider: ProviderID, Attributes: map[string]string{"api_key": key}})
+			if err == nil || strings.Contains(err.Error(), key) || strings.Contains(err.Error(), "upstream body") {
+				t.Fatalf("error leaked upstream detail: %v", err)
 			}
 		})
 	}
 }
 
-func TestQuotaPageIsStaticAndSecretFree(t *testing.T) {
-	if resources.QuotaPage == "" || strings.Contains(resources.QuotaPage, testKey) || strings.Contains(resources.QuotaPage, "setInterval") || strings.Contains(resources.QuotaPage, "reset button") {
-		t.Fatal("quota page contains a secret, polling, or reset action")
+func TestQuotaBucketClampsPercent(t *testing.T) {
+	if got := quotaBucket("5h", quotaWindow{Percent: 140}, "x").RemainingFraction; got != 0 {
+		t.Fatalf("percent>100 must clamp remaining to 0, got %v", got)
 	}
-	if !strings.Contains(resources.QuotaPage, "textContent") || !strings.Contains(resources.QuotaPage, "Remember password") {
-		t.Fatal("quota page missing safe rendering or login guidance")
-	}
-}
-
-func TestQuotaPageUsesManualSessionCache(t *testing.T) {
-	page := resources.QuotaPage
-	for _, marker := range []string{
-		`const storageKey = "opencode-go-provider:quota"`,
-		"sessionStorage.getItem(storageKey)",
-		"sessionStorage.setItem(storageKey, JSON.stringify(cache))",
-		"JSON.parse(stored)",
-		"typeof parsed === \"object\"",
-		"Array.isArray(parsed)",
-		"catch (_) {}",
-		"Object.entries(cache)",
-		"values.set(keyID, entry.usage)",
-		"cache[card.key_id] = {usage: result.usage, fetched_at: timestamp}",
-		"delete cache[keyID]",
-		"new Set(cards.map(card => card.key_id))",
-		"toLocaleString",
-	} {
-		if !strings.Contains(page, marker) {
-			t.Fatalf("quota page missing session cache marker %q", marker)
-		}
-	}
-	for _, marker := range []string{
-		"visibilitychange",
-		"document.hidden",
-		"window.onfocus",
-		"window.addEventListener(\"focus\"",
-		"TTL",
-		"expiry",
-		"expiration",
-		"bulk refresh",
-	} {
-		if strings.Contains(page, marker) {
-			t.Fatalf("quota page contains prohibited automatic or expiry behavior %q", marker)
-		}
+	if got := quotaBucket("5h", quotaWindow{Percent: -5}, "x").RemainingFraction; got != 1 {
+		t.Fatalf("percent<0 must clamp remaining to 1, got %v", got)
 	}
 }
 
-func TestQuotaPageUsesNativeQuotaStylesAndThemeBridge(t *testing.T) {
-	for _, marker := range []string{
-		"quota-page",
-		"quota-grid",
-		"quota-card",
-		"quota-track",
-		"quota-fill",
-		"repeat(auto-fill, minmax(380px, 1fr))",
-		"@media (max-width: 768px)",
-		`[data-theme="white"]`,
-		`[data-theme="dark"]`,
-		`window.parent.document`,
-		`data-theme`,
-		`--bg-secondary`,
-		`frameElement.style.backgroundColor`,
-		`frameElement.parentElement.style.backgroundColor`,
-		".quota-refresh",
-		"--bg-secondary: #faf9f5",
-		"--bg-primary: #f0eee8",
-		"--bg-tertiary: #e9e6df",
-		"--text-primary: #2d2a26",
-		"--text-secondary: #6d6760",
-		"--text-tertiary: #a29c95",
-		"--border-color: #e3e1db",
-		"--primary-color: #8b8680",
-		"--primary-hover: #7f7a74",
-		"border-radius: 8px; padding: 8px 10px",
-		`MutationObserver`,
-		`catch (_) {}`,
-	} {
-		if !strings.Contains(resources.QuotaPage, marker) {
-			t.Fatalf("quota page missing styling marker %q", marker)
-		}
+func absF(x float64) float64 {
+	if x < 0 {
+		return -x
 	}
-	if strings.Contains(resources.QuotaPage, `textContent = "Refresh card"`) || strings.Contains(resources.QuotaPage, "quota-button") || strings.Contains(resources.QuotaPage, "quota-refresh-small") {
-		t.Fatal("quota page does not have exactly one secondary refresh button path")
-	}
-	for _, marker := range []string{"querySelectorAll('head link[rel=\"stylesheet\"], head style')", "cloneNode(true)", "dataset.cpaStyle"} {
-		if strings.Contains(resources.QuotaPage, marker) {
-			t.Fatalf("quota page still clones parent styles: %q", marker)
-		}
-	}
+	return x
 }
 
 func mustHashPrefix(key string) string {

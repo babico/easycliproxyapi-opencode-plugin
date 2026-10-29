@@ -22,7 +22,7 @@ const ProviderID = "opencode-go"
 // pluginName / pluginVersion are reported in registration metadata.
 const (
 	pluginName    = "opencode-go-provider"
-	pluginVersion = "1.1.0"
+	pluginVersion = "2.2.0"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
@@ -99,33 +99,74 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	case pluginabi.MethodAuthLoginStart:
 		var req struct {
 			pluginapi.AuthLoginStartRequest
+			HostCallbackID string `json:"host_callback_id,omitempty"`
 		}
 		if json.Unmarshal(request, &req) != nil {
 			return ErrEnvelope("invalid_request", "malformed auth login request body"), nil
 		}
-		_, err := (authProvider{}).StartLogin(context.Background(), req.AuthLoginStartRequest)
-		return ErrEnvelope("unsupported", err.Error()), nil
-	case pluginabi.MethodAuthLoginPoll:
-		var req struct{ pluginapi.AuthLoginPollRequest }
-		if json.Unmarshal(request, &req) != nil {
-			return ErrEnvelope("invalid_request", "malformed auth poll request body"), nil
-		}
-		_, err := (authProvider{}).PollLogin(context.Background(), req.AuthLoginPollRequest)
-		return ErrEnvelope("unsupported", err.Error()), nil
-	case pluginabi.MethodAuthRefresh:
-		var req struct{ pluginapi.AuthRefreshRequest }
-		if json.Unmarshal(request, &req) != nil {
-			return ErrEnvelope("invalid_request", "malformed auth refresh request body"), nil
-		}
-		resp, err := (authProvider{}).RefreshAuth(context.Background(), req.AuthRefreshRequest)
+		resp, err := m.authLoginStart(req.HostCallbackID, req.AuthLoginStartRequest)
 		if err != nil {
 			return ErrEnvelope("auth_failure", err.Error()), nil
 		}
 		return okEnvelope(resp), nil
-	case pluginabi.MethodManagementRegister:
-		return m.registerManagement(request)
-	case pluginabi.MethodManagementHandle:
-		return m.handleManagement(request)
+	case pluginabi.MethodAuthLoginPoll:
+		var req struct {
+			pluginapi.AuthLoginPollRequest
+			HostCallbackID string `json:"host_callback_id,omitempty"`
+		}
+		if json.Unmarshal(request, &req) != nil {
+			return ErrEnvelope("invalid_request", "malformed auth poll request body"), nil
+		}
+		resp, err := m.authLoginPoll(req.HostCallbackID, req.AuthLoginPollRequest)
+		if err != nil {
+			return ErrEnvelope("auth_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
+	case pluginabi.MethodAuthRefresh:
+		var req struct {
+			pluginapi.AuthRefreshRequest
+			HostCallbackID string `json:"host_callback_id,omitempty"`
+		}
+		if json.Unmarshal(request, &req) != nil {
+			return ErrEnvelope("invalid_request", "malformed auth refresh request body"), nil
+		}
+		resp, err := m.authRefresh(req.HostCallbackID, req.AuthRefreshRequest)
+		if err != nil {
+			return ErrEnvelope("auth_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
+	case pluginabi.MethodQuotaIdentifier:
+		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
+	case pluginabi.MethodQuotaDescribe:
+		var req pluginapi.QuotaDescribeRequest
+		if json.Unmarshal(request, &req) != nil {
+			return ErrEnvelope("invalid_request", "malformed quota describe request body"), nil
+		}
+		resp, err := quotaProvider{m}.DescribeQuota(context.Background(), req)
+		if err != nil {
+			return ErrEnvelope("quota_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
+	case pluginabi.MethodQuotaFetch:
+		var req pluginapi.QuotaFetchRequest
+		if json.Unmarshal(request, &req) != nil {
+			return ErrEnvelope("invalid_request", "malformed quota fetch request body"), nil
+		}
+		resp, err := quotaProvider{m}.FetchQuota(context.Background(), req)
+		if err != nil {
+			return ErrEnvelope("quota_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
+	case pluginabi.MethodQuotaReset:
+		var req pluginapi.QuotaResetRequest
+		if json.Unmarshal(request, &req) != nil {
+			return ErrEnvelope("invalid_request", "malformed quota reset request body"), nil
+		}
+		resp, err := quotaProvider{m}.ResetQuota(context.Background(), req)
+		if err != nil {
+			return ErrEnvelope("quota_failure", err.Error()), nil
+		}
+		return okEnvelope(resp), nil
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
 	case pluginabi.MethodExecutorCountTokens:
@@ -157,7 +198,7 @@ type capabilities struct {
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope,omitempty"`
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
-	ManagementAPI         bool                         `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
 type registrationResult struct {
@@ -218,6 +259,31 @@ func pluginConfigFields() []pluginapi.ConfigField {
 			Type:        pluginapi.ConfigFieldTypeBoolean,
 			Description: "Allow plain http:// URLs for local testing/mocking (default: false).",
 		},
+		{
+			Name:        "console-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "OpenCode console URL for OAuth device login (default: https://opencode.ai/console).",
+		},
+		{
+			Name:        "oauth-client-id",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "OAuth client_id for the device flow (default: opencode-cli).",
+		},
+		{
+			Name:        "user-agent",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "User-Agent for console login requests (default: opencode/1.19.5).",
+		},
+		{
+			Name:        "session-id",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Fallback x-opencode-session value (default: cpa-main).",
+		},
+		{
+			Name:        "inference-base-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Inference endpoint family for OAuth credentials (default: https://opencode.ai/inference/go).",
+		},
 	}
 }
 
@@ -239,57 +305,11 @@ func registrationEnvelope() []byte {
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
 			ExecutorInputFormats:  formats,
 			ExecutorOutputFormats: formats,
-			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	})
 }
 
-func (m *Manager) registerManagement(request []byte) ([]byte, error) {
-	var req struct {
-		Plugin           pluginapi.Metadata `json:"Plugin"`
-		BasePath         string             `json:"BasePath"`
-		ResourceBasePath string             `json:"ResourceBasePath"`
-	}
-	if err := json.Unmarshal(request, &req); err != nil {
-		return ErrEnvelope("invalid_request", "malformed management registration request body"), nil
-	}
-	return okEnvelope(struct {
-		Routes []struct {
-			Method string `json:"method"`
-			Path   string `json:"path"`
-		} `json:"routes"`
-		Resources []struct {
-			Path        string `json:"path"`
-			Menu        string `json:"menu"`
-			Description string `json:"description"`
-		} `json:"resources"`
-	}{
-		Routes: []struct {
-			Method string `json:"method"`
-			Path   string `json:"path"`
-		}{{Method: "POST", Path: "/plugins/" + pluginName + "/quota-usage"}},
-		Resources: []struct {
-			Path        string `json:"path"`
-			Menu        string `json:"menu"`
-			Description string `json:"description"`
-		}{{Path: "/quota", Menu: "OpenCode Go Quota", Description: "View OpenCode Go quota windows."}},
-	}), nil
-}
-
-func (m *Manager) handleManagement(request []byte) ([]byte, error) {
-	var req struct {
-		pluginapi.ManagementRequest
-		HostCallbackID string `json:"host_callback_id,omitempty"`
-	}
-	if err := json.Unmarshal(request, &req); err != nil {
-		return ErrEnvelope("invalid_request", "malformed management request body"), nil
-	}
-	resp, err := m.HandleManagement(context.Background(), req.ManagementRequest)
-	if err != nil {
-		return ErrEnvelope("management_failure", err.Error()), nil
-	}
-	return okEnvelope(resp), nil
-}
 
 // handleLifecycle implements plugin.register / plugin.reconfigure: load
 // config, refresh the catalog once, publish state, restart the refresh
