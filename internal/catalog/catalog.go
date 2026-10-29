@@ -60,6 +60,8 @@ func routeFromString(s string) (Route, bool) {
 }
 
 // ModelRecord is one routable normalized catalog entry (arch §7, FR-003).
+// Plan/BaseURL identify the upstream endpoint family the model is served
+// from (go = zen/go/v1, zen = zen/v1); the executor routes by these.
 type ModelRecord struct {
 	PublicID     string
 	UpstreamID   string
@@ -71,6 +73,17 @@ type ModelRecord struct {
 	InputModes   []string
 	OutputModes  []string
 	Thinking     *pluginapi.ThinkingSupport
+	PlanName     string
+	BaseURL      string
+}
+
+// planRaw is one upstream plan's decoded catalog entries retained for
+// SeedFrom rebuilds; plan metadata (base-url, prefix) is always taken from
+// the current config, never from the retained raw.
+type planRaw struct {
+	PlanName string
+	Entries  []rawModel
+	Warns    []string
 }
 
 // UnsupportedModel is a discovered model excluded from the routable set,
@@ -151,11 +164,11 @@ type Manager struct {
 	client HostClient
 
 	mu sync.Mutex
-	// raw retains the decoded upstream entries behind the current snapshot
-	// so SeedFrom can rebuild records against a NEW config (route overrides,
-	// protocol flags, and prefix settings may all have changed since the
-	// snapshot was built).
-	raw    []rawModel
+	// raw retains the decoded upstream entries behind the current snapshot,
+	// grouped by plan name, so SeedFrom can rebuild records against a NEW
+	// config (route overrides, protocol flags, and prefix settings may all
+	// have changed since the snapshot was built).
+	raw    []planRaw
 	models []ModelRecord
 	// index maps both PublicID and UpstreamID to their record so ID
 	// resolution is O(1); rebuilt atomically with models on every swap.
@@ -164,8 +177,14 @@ type Manager struct {
 	warns []string
 }
 
-// New returns a Manager serving cfg through the host client.
+// New returns a Manager serving cfg through the host client. When cfg.Plans
+// is empty (direct construction bypassing config.Load) it synthesizes the
+// single legacy plan from base-url/catalog-url/model-prefix so Refresh always
+// has at least one endpoint to fetch.
 func New(cfg config.Config, client HostClient) *Manager {
+	if len(cfg.Plans) == 0 {
+		cfg.Plans = config.BuildPlans(nil, cfg.BaseURL, cfg.CatalogURL, cfg.ModelPrefix)
+	}
 	return &Manager{cfg: cfg, client: client}
 }
 
@@ -201,42 +220,49 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 		// classified path instead of panicking inside Do.
 		return m.fail("host client unavailable")
 	}
-	req := pluginapi.HTTPRequest{
-		Method: http.MethodGet,
-		URL:    m.cfg.CatalogURL,
-		Headers: http.Header{
-			"Authorization": []string{"Bearer " + apiKey},
-			"Accept":        []string{"application/json"},
-		},
-	}
-	resp, err := m.client.Do(ctx, req)
-	if err != nil {
-		return m.fail("network error")
-	}
+	var raws []planRaw
 	budget := max(m.cfg.MaxResponseBytes, catalogBudgetFloor)
-	if int64(len(resp.Body)) > budget {
-		return m.fail("response exceeds max-response-bytes")
+	for _, plan := range m.cfg.Plans {
+		if !plan.Enabled {
+			continue
+		}
+		req := pluginapi.HTTPRequest{
+			Method: http.MethodGet,
+			URL:    plan.CatalogURL,
+			Headers: http.Header{
+				"Authorization": []string{"Bearer " + apiKey},
+				"Accept":        []string{"application/json"},
+			},
+		}
+		resp, err := m.client.Do(ctx, req)
+		if err != nil {
+			return m.fail("network error")
+		}
+		if int64(len(resp.Body)) > budget {
+			return m.fail("response exceeds max-response-bytes")
+		}
+		if resp.StatusCode != http.StatusOK {
+			return m.fail(fmt.Sprintf("http %d", resp.StatusCode))
+		}
+		var env struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Body, &env); err != nil {
+			return m.fail("invalid json")
+		}
+		var entries []rawModel
+		var warns []string
+		if env.Data == nil {
+			// Key ABSENCE is upstream shape drift, never an intended clear:
+			// clear like an empty plan (swap(nil)) but leave a diagnostic.
+			// A present-but-empty array stays silent (tested-intended state).
+			warns = append(warns, fmt.Sprintf(`plan %q catalog response missing "data" field`, plan.Name))
+		} else if err := json.Unmarshal(env.Data, &entries); err != nil {
+			return m.fail("invalid json")
+		}
+		raws = append(raws, planRaw{PlanName: plan.Name, Entries: entries, Warns: warns})
 	}
-	if resp.StatusCode != http.StatusOK {
-		return m.fail(fmt.Sprintf("http %d", resp.StatusCode))
-	}
-	var env struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(resp.Body, &env); err != nil {
-		return m.fail("invalid json")
-	}
-	var entries []rawModel
-	var warns []string
-	if env.Data == nil {
-		// Key ABSENCE is upstream shape drift, never an intended clear:
-		// clear like an empty plan (swap(nil)) but leave a diagnostic.
-		// A present-but-empty array stays silent (tested-intended state).
-		warns = append(warns, `upstream catalog response missing "data" field`)
-	} else if err := json.Unmarshal(env.Data, &entries); err != nil {
-		return m.fail("invalid json")
-	}
-	m.swap(entries, warns...)
+	m.swap(raws)
 	return nil
 }
 
@@ -253,106 +279,125 @@ func (m *Manager) fail(category string) error {
 	return fmt.Errorf("catalog refresh failed: %s", category)
 }
 
-// swap builds the new snapshot from decoded entries and installs it
-// atomically under the mutex (FR-010 dedup, arch §5 route priority).
-// extraWarns are caller-supplied snapshot diagnostics (e.g. decode-level
-// shape-drift notices) recorded alongside the per-entry ones.
-func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
-	models := make([]ModelRecord, 0, len(entries))
-	index := make(map[string]ModelRecord, len(entries)*2)
+// swap builds the new snapshot from decoded per-plan entries and installs it
+// atomically under the mutex (FR-010 dedup, arch §5 route priority). Each plan
+// contributes models under its own prefix and routes them to its own base-url.
+func (m *Manager) swap(raws []planRaw) {
+	total := 0
+	for _, r := range raws {
+		total += len(r.Entries)
+	}
+	models := make([]ModelRecord, 0, total)
+	index := make(map[string]ModelRecord, total*2)
 	var unsup []UnsupportedModel
 	var warns []string
-	warns = append(warns, extraWarns...)
-	seen := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		if e.ID == "" {
-			unsup = append(unsup, UnsupportedModel{Reason: "missing id"})
-			continue
+	upstreamSeen := make(map[string]bool, total)
+	// plansByName resolves retained raw back to CURRENT config plan metadata,
+	// so a reconfigure that changes a plan's base-url/prefix takes effect at
+	// seed time (F5) rather than serving stale routing.
+	plansByName := make(map[string]config.Plan, len(m.cfg.Plans))
+	for _, p := range m.cfg.Plans {
+		if p.Enabled {
+			plansByName[p.Name] = p
 		}
-		if seen[e.ID] {
-			warns = append(warns, fmt.Sprintf("duplicate model %q ignored; keeping first occurrence", e.ID))
-			continue
-		}
-		seen[e.ID] = true
-		route, endpoint, ok, warn := m.resolve(e)
-		if warn != "" {
-			warns = append(warns, warn)
-		}
+	}
+	for _, raw := range raws {
+		warns = append(warns, raw.Warns...)
+		plan, ok := plansByName[raw.PlanName]
 		if !ok {
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: "no route determined"})
+			// Plan disabled/removed since the snapshot was built: drop its
+			// models rather than route them to a stale base-url.
 			continue
 		}
-		if !m.protocolEnabled(route) {
-			// Flags apply at snapshot build; a stale snapshot kept per
-			// FR-002 reflects the flags it was built with until the next
-			// successful refresh.
-			unsup = append(unsup, UnsupportedModel{
-				UpstreamID: e.ID,
-				Reason:     fmt.Sprintf("protocol %s disabled by config", route),
-			})
-			continue
+		seen := make(map[string]bool, len(raw.Entries))
+		for _, e := range raw.Entries {
+			if e.ID == "" {
+				unsup = append(unsup, UnsupportedModel{Reason: "missing id"})
+				continue
+			}
+			if seen[e.ID] {
+				warns = append(warns, fmt.Sprintf("duplicate model %q ignored; keeping first occurrence", e.ID))
+				continue
+			}
+			seen[e.ID] = true
+			route, endpoint, rok, warn := m.resolve(e)
+			if warn != "" {
+				warns = append(warns, warn)
+			}
+			if !rok {
+				unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: "no route determined"})
+				continue
+			}
+			if !m.protocolEnabled(route) {
+				// Flags apply at snapshot build; a stale snapshot kept per
+				// FR-002 reflects the flags it was built with until the next
+				// successful refresh.
+				unsup = append(unsup, UnsupportedModel{
+					UpstreamID: e.ID,
+					Reason:     fmt.Sprintf("protocol %s disabled by config", route),
+				})
+				continue
+			}
+			if endpoint != "" && endpointEscapesBase(plan.BaseURL, endpoint) {
+				// The joined URL must stay on the configured upstream
+				// authority so overrides cannot rewrite the host and send
+				// credentials/prompts to an attacker (spec 05 §2).
+				unsup = append(unsup, UnsupportedModel{
+					UpstreamID: e.ID,
+					Reason:     "resolved endpoint escapes the configured upstream host",
+				})
+				continue
+			}
+			if endpoint == "" {
+				endpoint = route.EndpointPath()
+			}
+			inputModes := firstNonEmpty(e.InputModes, e.InputModalities)
+			outputModes := firstNonEmpty(e.OutputModes, e.OutputModalities)
+			display := e.DisplayName
+			if display == "" {
+				display = e.ID
+			}
+			rec := ModelRecord{
+				PublicID:     config.PublicIDForPlan(plan, e.ID),
+				UpstreamID:   e.ID,
+				DisplayName:  display,
+				Protocol:     route,
+				EndpointPath: endpoint,
+				ContextLimit: e.ContextLength,
+				OutputLimit:  e.MaxOutputTokens,
+				InputModes:   inputModes,
+				OutputModes:  outputModes,
+				Thinking:     normalizeThinking(e.Thinking, e.ReasoningLevels),
+				PlanName:     plan.Name,
+				BaseURL:      plan.BaseURL,
+			}
+			// PublicID is unique across plans (distinct prefixes), so it is
+			// always safe to index. UpstreamID is indexed only on first sight
+			// because the SAME upstream id can legitimately live on two plans
+			// (go + zen); bare-id lookup is a convenience, never canonical.
+			if other, pok := index[rec.PublicID]; ok && pok {
+				reason := fmt.Sprintf("public id %q collides with upstream id %q", rec.PublicID, other.UpstreamID)
+				warns = append(warns, reason)
+				unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+				continue
+			}
+			if !upstreamSeen[rec.UpstreamID] {
+				if other, iok := index[rec.UpstreamID]; iok {
+					reason := fmt.Sprintf("public id %q collides with upstream id %q", other.PublicID, rec.UpstreamID)
+					warns = append(warns, reason)
+					unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+					continue
+				}
+				upstreamSeen[rec.UpstreamID] = true
+			}
+			models = append(models, rec)
+			index[rec.PublicID] = rec
+			index[rec.UpstreamID] = rec
 		}
-		if endpoint != "" && endpointEscapesBase(m.cfg.BaseURL, endpoint) {
-			// The joined URL must stay on the configured upstream
-			// authority. Override endpoints flow through here, so they
-			// cannot rewrite the URL host — e.g. "/v1@evil.com/x"
-			// against a bare-host base-url turns the base into userinfo
-			// and would send credentials/prompts to an attacker host
-			// (spec 05 §2 trust boundary).
-			unsup = append(unsup, UnsupportedModel{
-				UpstreamID: e.ID,
-				Reason:     "resolved endpoint escapes the configured upstream host",
-			})
-			continue
-		}
-		if endpoint == "" {
-			endpoint = route.EndpointPath()
-		}
-		inputModes := firstNonEmpty(e.InputModes, e.InputModalities)
-		outputModes := firstNonEmpty(e.OutputModes, e.OutputModalities)
-		display := e.DisplayName
-		if display == "" {
-			display = e.ID
-		}
-		rec := ModelRecord{
-			PublicID:     config.PublicID(m.cfg, e.ID),
-			UpstreamID:   e.ID,
-			DisplayName:  display,
-			Protocol:     route,
-			EndpointPath: endpoint,
-			ContextLimit: e.ContextLength,
-			OutputLimit:  e.MaxOutputTokens,
-			InputModes:   inputModes,
-			OutputModes:  outputModes,
-			Thinking:     normalizeThinking(e.Thinking, e.ReasoningLevels),
-		}
-		// With a prefix enabled, one record's PublicID can equal another
-		// record's UpstreamID (upstream "foo" and "opencode-go/foo" both
-		// claim index key "<prefix>/foo"); last-write-wins would silently
-		// misroute. First in catalog order wins (same dedup rule as
-		// duplicate IDs); the later record is excluded. Same-role clashes
-		// are impossible — distinct upstream IDs and an injective public
-		// mapping — so the slot owner always holds the key via its other
-		// role, and a record's own public==upstream rewrite is not a clash.
-		if other, ok := index[rec.PublicID]; ok {
-			reason := fmt.Sprintf("public id %q collides with upstream id %q", rec.PublicID, other.UpstreamID)
-			warns = append(warns, reason)
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
-			continue
-		}
-		if other, ok := index[rec.UpstreamID]; ok {
-			reason := fmt.Sprintf("public id %q collides with upstream id %q", other.PublicID, rec.UpstreamID)
-			warns = append(warns, reason)
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
-			continue
-		}
-		models = append(models, rec)
-		index[rec.PublicID] = rec
-		index[rec.UpstreamID] = rec
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.raw, m.models, m.index, m.unsup, m.warns = entries, models, index, unsup, warns
+	m.raw, m.models, m.index, m.unsup, m.warns = raws, models, index, unsup, warns
 }
 
 // protocolEnabled reports whether the resolved route's protocol flag is on

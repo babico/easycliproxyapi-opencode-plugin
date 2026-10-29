@@ -284,6 +284,11 @@ func pluginConfigFields() []pluginapi.ConfigField {
 			Type:        pluginapi.ConfigFieldTypeString,
 			Description: "Inference endpoint family for OAuth credentials (default: https://opencode.ai/inference/go).",
 		},
+		{
+			Name:        "plans",
+			Type:        pluginapi.ConfigFieldTypeArray,
+			Description: "Upstream endpoint families (`- name: go|zen`, `base-url`, `model-prefix`, `enabled`). OpenCode Go and Zen are different endpoints; defaults to a single go plan from base-url when omitted.",
+		},
 	}
 }
 

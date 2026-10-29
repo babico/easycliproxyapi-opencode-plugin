@@ -82,10 +82,14 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 }
 
 // effectiveBaseURL returns the per-credential override when set (OAuth
-// credentials route to inference/go), otherwise the configured zen/go base.
+// credentials route to inference/go), else the model's own plan base-url
+// (go vs zen), else the configured legacy base.
 func (r *resolvedExecution) effectiveBaseURL() string {
 	if r.baseURL != "" {
 		return r.baseURL
+	}
+	if r.rec.BaseURL != "" {
+		return r.rec.BaseURL
 	}
 	return r.cfg.BaseURL
 }

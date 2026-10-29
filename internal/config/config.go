@@ -29,11 +29,32 @@ const (
 	DefaultUserAgent         = "opencode/1.19.5" // anomalyco/opencode en yeni release (2026-10-28)
 	DefaultSessionID         = "cpa-main"
 	DefaultInferenceBaseURL  = "https://opencode.ai/inference/go"
+
+	// Default upstream plans. "go" = OpenCode Go subscription catalog
+	// (zen/go/v1); "zen" = the broader OpenCode Zen catalog (zen/v1).
+	DefaultPlanName    = "go"
+	DefaultPlanPrefix  = "opencode-go"
+	DefaultZenBaseURL  = "https://opencode.ai/zen/v1"
+	DefaultZenName     = "zen"
+	DefaultZenPrefix   = "opencode-zen"
 )
 
 type ModelPrefix struct {
 	Enabled bool
 	Value   string
+}
+
+// Plan is one upstream OpenCode endpoint family. OpenCode "Go" (the paid
+// plan) and "Zen" (the broader/free-hosted catalog) are DIFFERENT endpoints
+// with different catalogs; a shared account credential serves both. When the
+// config omits `plans`, Load synthesizes a single plan from the legacy
+// base-url/catalog-url/model-prefix fields (backward compatible).
+type Plan struct {
+	Name       string
+	BaseURL    string
+	CatalogURL string
+	Prefix     ModelPrefix
+	Enabled    bool
 }
 
 type APIKey struct {
@@ -74,6 +95,10 @@ type Config struct {
 	UserAgent         string
 	SessionID         string
 	InferenceBaseURL  string
+
+	// Plans is the set of upstream OpenCode endpoint families (go + zen).
+	// Always non-empty after Load (synthesized from legacy fields if unset).
+	Plans []Plan
 }
 
 // rawConfig mirrors the YAML shape; pointer fields distinguish "unset"
@@ -96,6 +121,15 @@ type rawConfig struct {
 	UserAgent         *string `yaml:"user-agent"`
 	SessionID         *string `yaml:"session-id"`
 	InferenceBaseURL  *string `yaml:"inference-base-url"`
+	Plans             []rawPlan `yaml:"plans"`
+}
+
+type rawPlan struct {
+	Name       *string     `yaml:"name"`
+	BaseURL    *string     `yaml:"base-url"`
+	CatalogURL *string     `yaml:"catalog-url"`
+	Prefix     rawPrefix   `yaml:"model-prefix"`
+	Enabled    *bool       `yaml:"enabled"`
 }
 
 type rawPrefix struct {
@@ -183,10 +217,58 @@ func Load(yamlBytes []byte) (Config, error) {
 	} else {
 		c.CatalogURL = strings.TrimRight(c.BaseURL, "/") + "/models"
 	}
+	c.Plans = BuildPlans(raw.Plans, c.BaseURL, c.CatalogURL, c.ModelPrefix)
 	if err := c.validate(); err != nil {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// buildPlans materializes the upstream plan set. When the operator omits
+// `plans`, a single "go" plan is synthesized from the legacy base-url/
+// catalog-url/model-prefix fields so existing configs and tests are
+// unchanged. When `plans` is present, each entry becomes its own endpoint
+// family (e.g. go = zen/go/v1 + zen = zen/v1).
+func BuildPlans(rawPlans []rawPlan, legacyBase, legacyCatalog string, legacyPrefix ModelPrefix) []Plan {
+	if len(rawPlans) == 0 {
+		return []Plan{{
+			Name:       DefaultPlanName,
+			BaseURL:    legacyBase,
+			CatalogURL: legacyCatalog,
+			Prefix:     legacyPrefix,
+			Enabled:    true,
+		}}
+	}
+	plans := make([]Plan, 0, len(rawPlans))
+	for _, rp := range rawPlans {
+		enabled := orDefault(rp.Enabled, true)
+		base := orDefault(rp.BaseURL, legacyBase)
+		catalog := base
+		if rp.CatalogURL != nil {
+			catalog = strings.TrimRight(*rp.CatalogURL, "/")
+		} else {
+			catalog = strings.TrimRight(base, "/") + "/models"
+		}
+		plans = append(plans, Plan{
+			Name:       orDefault(rp.Name, DefaultPlanName),
+			BaseURL:    strings.TrimRight(base, "/"),
+			CatalogURL: catalog,
+			Prefix:     ModelPrefix{
+				Enabled: orDefault(rp.Prefix.Enabled, true),
+				Value:   orDefault(rp.Prefix.Value, DefaultPlanPrefix),
+			},
+			Enabled: enabled,
+		})
+	}
+	return plans
+}
+
+// PublicIDForPlan returns the client-facing model ID under one plan's prefix.
+func PublicIDForPlan(p Plan, upstreamID string) string {
+	if p.Prefix.Enabled {
+		return p.Prefix.Value + "/" + upstreamID
+	}
+	return upstreamID
 }
 
 // PublicID returns the client-facing model ID (FR-003).
@@ -238,6 +320,20 @@ func (c Config) validate() error {
 	}
 	if c.ModelPrefix.Enabled && !validPrefix(c.ModelPrefix.Value) {
 		return fmt.Errorf("model-prefix.value: invalid provider-ID characters %q", c.ModelPrefix.Value)
+	}
+	for _, p := range c.Plans {
+		if !p.Enabled {
+			continue
+		}
+		if err := validateURL("plans."+p.Name+".base-url", p.BaseURL, c.AllowHTTP); err != nil {
+			return err
+		}
+		if err := validateURL("plans."+p.Name+".catalog-url", p.CatalogURL, c.AllowHTTP); err != nil {
+			return err
+		}
+		if p.Prefix.Enabled && !validPrefix(p.Prefix.Value) {
+			return fmt.Errorf("plans.%s.model-prefix.value: invalid provider-ID characters %q", p.Name, p.Prefix.Value)
+		}
 	}
 	return nil
 }

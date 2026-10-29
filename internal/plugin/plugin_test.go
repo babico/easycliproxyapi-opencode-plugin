@@ -433,7 +433,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
 	if reg.Metadata.Name != "opencode-go-provider" || reg.Metadata.Version != pluginVersion ||
-		len(reg.Metadata.ConfigFields) != 15 {
+		len(reg.Metadata.ConfigFields) != 16 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}
 	if !reg.Capabilities.ModelProvider || !reg.Capabilities.AuthProvider {
@@ -509,6 +509,7 @@ func TestRegistrationConfigFields(t *testing.T) {
 		{"user-agent", pluginapi.ConfigFieldTypeString},
 		{"session-id", pluginapi.ConfigFieldTypeString},
 		{"inference-base-url", pluginapi.ConfigFieldTypeString},
+		{"plans", pluginapi.ConfigFieldTypeArray},
 	}
 
 	if len(reg.Metadata.ConfigFields) != len(expectedFields) {

@@ -17,6 +17,20 @@ import (
 
 const testKey = "sk-test-key-123"
 
+// urlClient returns a different canned catalog per request URL (for multi-plan tests).
+type urlClient struct {
+	byURL map[string]pluginapi.HTTPResponse
+	seen  []string
+}
+
+func (u *urlClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	u.seen = append(u.seen, req.URL)
+	if r, ok := u.byURL[req.URL]; ok {
+		return r, nil
+	}
+	return pluginapi.HTTPResponse{StatusCode: 404}, nil
+}
+
 // fakeClient is a canned, thread-safe HostClient capturing the last request.
 type fakeClient struct {
 	mu     sync.Mutex
@@ -1084,7 +1098,7 @@ func TestRefreshDataKeyAbsentVsEmpty(t *testing.T) {
 	m := newManager(testCfg(), fc)
 	mustRefresh(t, m)
 
-	const driftWarn = `upstream catalog response missing "data" field`
+	const driftWarn = `plan "go" catalog response missing "data" field`
 
 	// Key absent: cleared snapshot plus shape-drift warning.
 	fc.set(pluginapi.HTTPResponse{
@@ -1169,5 +1183,81 @@ func TestReasoningMapAndDeclarationMerge(t *testing.T) {
 	}
 	if rec.Thinking.Min != 1024 || rec.Thinking.Max != 32768 {
 		t.Fatalf("bounds lost: min=%d max=%d", rec.Thinking.Min, rec.Thinking.Max)
+	}
+}
+
+func TestDualPlanRouting(t *testing.T) {
+	cfg := testCfg()
+	cfg.BaseURL = "https://opencode.ai/zen/go/v1"
+	cfg.Plans = []config.Plan{
+		{Name: "go", BaseURL: "https://opencode.ai/zen/go/v1", CatalogURL: "https://opencode.ai/zen/go/v1/models",
+			Prefix: config.ModelPrefix{Enabled: true, Value: "opencode-go"}, Enabled: true},
+		{Name: "zen", BaseURL: "https://opencode.ai/zen/v1", CatalogURL: "https://opencode.ai/zen/v1/models",
+			Prefix: config.ModelPrefix{Enabled: true, Value: "opencode-zen"}, Enabled: true},
+	}
+	uc := &urlClient{byURL: map[string]pluginapi.HTTPResponse{
+		"https://opencode.ai/zen/go/v1/models": {StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.3","context_length":200000}]}`)},
+		"https://opencode.ai/zen/v1/models":    {StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.3","context_length":400000},{"id":"qwen3.8-max","context_length":256000}]}`)},
+	}}
+	m := New(cfg, uc)
+	if err := m.Refresh(context.Background(), testKey); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	// both plans fetched
+	if len(uc.seen) != 2 {
+		t.Fatalf("fetched %d plan catalogs, want 2: %v", len(uc.seen), uc.seen)
+	}
+	models := m.Models()
+	if len(models) != 3 {
+		t.Fatalf("published %d models, want 3: %+v", len(models), models)
+	}
+	// same upstream id on two plans -> two distinct PublicIDs, both routable
+	got, okGo := m.Lookup("opencode-go/glm-5.3")
+	zen, okZen := m.Lookup("opencode-zen/glm-5.3")
+	if !okGo || !okZen {
+		t.Fatalf("lookups failed okGo=%v okZen=%v", okGo, okZen)
+	}
+	if got.BaseURL != "https://opencode.ai/zen/go/v1" || got.PlanName != "go" {
+		t.Fatalf("go model routed wrong: %+v", got)
+	}
+	if zen.BaseURL != "https://opencode.ai/zen/v1" || zen.PlanName != "zen" {
+		t.Fatalf("zen model routed wrong: %+v", zen)
+	}
+	if got.ContextLimit == zen.ContextLimit {
+		t.Fatalf("plans should carry independent metadata; both ctx=%d", got.ContextLimit)
+	}
+	if _, ok := m.Lookup("opencode-zen/qwen3.8-max"); !ok {
+		t.Fatal("zen-only model not published")
+	}
+}
+
+func TestPlanDisabledIsDroppedAtSeed(t *testing.T) {
+	cfg := testCfg()
+	cfg.BaseURL = "https://opencode.ai/zen/go/v1"
+	cfg.Plans = []config.Plan{
+		{Name: "go", BaseURL: "https://opencode.ai/zen/go/v1", CatalogURL: "https://opencode.ai/zen/go/v1/models",
+			Prefix: config.ModelPrefix{Enabled: true, Value: "opencode-go"}, Enabled: true},
+		{Name: "zen", BaseURL: "https://opencode.ai/zen/v1", CatalogURL: "https://opencode.ai/zen/v1/models",
+			Prefix: config.ModelPrefix{Enabled: true, Value: "opencode-zen"}, Enabled: true},
+	}
+	uc := &urlClient{byURL: map[string]pluginapi.HTTPResponse{
+		"https://opencode.ai/zen/go/v1/models": {StatusCode: 200, Body: []byte(`{"data":[{"id":"glm-5.3"}]}`)},
+		"https://opencode.ai/zen/v1/models":    {StatusCode: 200, Body: []byte(`{"data":[{"id":"qwen3.8-max"}]}`)},
+	}}
+	m := New(cfg, uc)
+	_ = m.Refresh(context.Background(), testKey)
+	if _, ok := m.Lookup("opencode-zen/qwen3.8-max"); !ok {
+		t.Fatal("expected zen model before disabling")
+	}
+	// reconfigure: zen disabled. Seed must drop zen models and route by new cfg.
+	cfg2 := cfg
+	cfg2.Plans[1].Enabled = false
+	m2 := New(cfg2, &urlClient{})
+	m2.SeedFrom(m)
+	if _, ok := m2.Lookup("opencode-zen/qwen3.8-max"); ok {
+		t.Fatal("disabled plan model survived seed")
+	}
+	if _, ok := m2.Lookup("opencode-go/glm-5.3"); !ok {
+		t.Fatal("enabled plan model lost at seed")
 	}
 }
