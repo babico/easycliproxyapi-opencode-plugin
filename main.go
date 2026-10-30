@@ -1,4 +1,4 @@
-// Command opencode-go-provider builds the CLIProxyAPI native plugin DLL
+// Command easycli-proxyapi-opencode-provider builds the CLIProxyAPI native plugin DLL
 // exposing the OpenCode Go provider. This file is CGO glue only: every RPC
 // method is forwarded verbatim into internal/plugin.HandleCall.
 package main

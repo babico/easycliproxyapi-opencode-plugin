@@ -1,4 +1,15 @@
+# v2.3.0
+
 ## What's Changed
+
+### Changed
+
+- Renamed the plugin identity `opencode-go-provider` → `easycliproxyapi-opencode-provider`: registration metadata name, library filename (`easycliproxyapi-opencode-provider.so`/`.dll`/`.dylib`), `plugins.configs.<id>` key, `registry.json` id, and CI release asset names. The provider name `opencode-go`, the model prefixes (`opencode-go/`, `opencode-zen/`), and all credentials/plans are unchanged.
+- Upgrading: rename the `plugins.configs.opencode-go-provider` block, replace the library file, and archive the old `.so` outside the plugins directory so both ids cannot stay active at once.
+
+---
+
+## v2.2.0
 
 ### Fixed
 

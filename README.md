@@ -46,17 +46,17 @@ Build the dynamic shared library for your platform:
 
 ### Windows (AMD64)
 ```powershell
-go build -buildmode=c-shared -o plugins/windows/amd64/opencode-go-provider.dll .
+go build -buildmode=c-shared -o plugins/windows/amd64/easycliproxyapi-opencode-provider.dll .
 ```
 
 ### Linux (AMD64)
 ```bash
-go build -buildmode=c-shared -o plugins/linux/amd64/opencode-go-provider.so .
+go build -buildmode=c-shared -o plugins/linux/amd64/easycliproxyapi-opencode-provider.so .
 ```
 
 ### macOS (ARM64)
 ```bash
-go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-provider.dylib .
+go build -buildmode=c-shared -o plugins/darwin/arm64/easycliproxyapi-opencode-provider.dylib .
 ```
 
 Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
@@ -108,12 +108,12 @@ The client → upstream replay is gated because replaying a field an endpoint ne
 
 ## Configuration
 
-Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-provider`:
+Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.easycliproxyapi-opencode-provider`:
 
 ```yaml
 plugins:
   configs:
-    opencode-go-provider:
+    easycli-proxyapi-opencode-provider:
       # Upstream base URL (default: "https://opencode.ai/zen/go/v1")
       base-url: "https://opencode.ai/zen/go/v1"
 
@@ -204,9 +204,11 @@ On Anthropic Messages routes, mixed parts stay inside their associated `tool_res
 
 ## Install via the plugin store
 
-This plugin is listed in the official CLIProxyAPI plugin store under the id `opencode-go-provider`, so Management Center → Plugin Store installs and updates it from this repository's GitHub releases without any extra configuration. The release assets follow the store layout (`opencode-go-provider_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
+This plugin is listed in the CLIProxyAPI plugin store under the id `easycliproxyapi-opencode-provider`, so Management Center → Plugin Store installs and updates it from this repository's GitHub releases without any extra configuration. The release assets follow the store layout (`easycliproxyapi-opencode-provider_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
 
 The plugin id was renamed from `opencode-go-cliproxyapi` to `opencode-go-provider` in v1.0.0. The upstream repository `massiveits/opencode-go-cliproxyapi` owns the old id in the official registry, and a registry cannot list the same id twice, so this fork ships under its own id. The provider name `opencode-go` and every model prefix (`opencode-go/glm-5.2`, …) are unchanged; only the plugin identity, the library filename and the `plugins.configs.<id>` key moved.
+
+In v2.3.0 the plugin id moved again: `opencode-go-provider` -> `easycliproxyapi-opencode-provider` (library filename and `plugins.configs.<id>` key too). The provider name `opencode-go`, the model prefixes (`opencode-go/`, `opencode-zen/`) and all credentials/plans are unchanged. Upgrading: rename the `plugins.configs.opencode-go-provider` block, replace the library file, and archive the old `.so` outside the plugins directory so both ids cannot stay active at once.
 
 Upgrading from v0.1.x: rename the `plugins.configs.opencode-go-cliproxyapi` block to `plugins.configs.opencode-go-provider`, replace the installed library with the new one, and remove the now-unused `opencode-go-cliproxyapi-v<version>.<ext>` file from the plugins directory. The plugin's own `registry.json` stays published at `https://raw.githubusercontent.com/xspeed1989/opencode-go-cliproxyapi/main/registry.json` for installs that pin this fork as an extra source:
 
@@ -216,7 +218,7 @@ plugins:
     - "https://raw.githubusercontent.com/xspeed1989/opencode-go-cliproxyapi/main/registry.json"
 ```
 
-The store writes `plugins/<goos>/<goarch>/opencode-go-provider-v<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
+The store writes `plugins/<goos>/<goarch>/easycliproxyapi-opencode-provider-v<version>.<ext>` and hot-swaps the loaded plugin, so a running server picks up the new version without an overwrite conflict. In Docker deployments keep the plugins directory on a mounted volume, otherwise the installed file disappears when the container is recreated. If the container cannot reach `raw.githubusercontent.com` / `api.github.com` directly, configure `proxy-url` so store requests use the proxy.
 
 The store resolves each plugin's latest version from the GitHub releases API and caches it per repository for ten minutes, falling back to the `version` field of `registry.json` when that lookup fails. Anonymous GitHub API quota is 60 requests per hour per IP and a single store page load queries every plugin of every enabled registry, so the lookup does fail; that is why `registry.json` carries the current release version. Two consequences for a fresh release: an update can take up to ten minutes to appear, and a row whose version column stays empty got neither the lookup nor the fallback. A plugin installed by hand (not through the store) is never offered an update, because the store cannot verify which source it came from — uninstall it and install it from the store.
 

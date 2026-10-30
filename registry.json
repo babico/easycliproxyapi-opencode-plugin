@@ -2,14 +2,14 @@
   "schema_version": 1,
   "plugins": [
     {
-      "id": "opencode-go-provider",
+      "id": "easycliproxyapi-opencode-provider",
       "name": "EasyCLIProxyAPI OpenCode Plugin",
-      "description": "OpenCode Go provider (xspeed1989 fork): Responses tool-call lifecycle fix, tool-call id normalization (reasoning-free replays no longer fail with 400), chain-of-thought round-trip (client replay limited to the DeepSeek family), two-way credential reconciliation, and an OpenCode Go quota page. Renamed from opencode-go-cliproxyapi in v1.0.0; the provider name and model prefixes are unchanged.",
+      "description": "OpenCode Go provider (babico fork of xspeed1989/opencode-go-cliproxyapi): Responses tool-call lifecycle fix, tool-call id normalization (reasoning-free replays no longer fail with 400), chain-of-thought round-trip (client replay limited to the DeepSeek family), two-way credential reconciliation, dual zen/go plans, and a native OpenCode Go quota page. Renamed from opencode-go-provider in v2.3.0 (and opencode-go-cliproxyapi in v1.0.0); the provider name (opencode-go) and model prefixes are unchanged.",
       "author": "babico",
-      "version": "2.2.0",
+      "version": "2.3.0",
       "repository": "https://github.com/babico/easycliproxyapi-opencode-plugin",
       "homepage": "https://github.com/babico/easycliproxyapi-opencode-plugin",
-      "license": "MIT",
+      "license": "WTFPL",
       "tags": [
         "provider",
         "opencode-go",

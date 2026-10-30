@@ -20,9 +20,12 @@ import (
 const ProviderID = "opencode-go"
 
 // pluginName / pluginVersion are reported in registration metadata.
+// pluginName is the plugin identity (config key + library filename). It is
+// deliberately distinct from ProviderID ("opencode-go"), which stays the
+// provider/model/credential namespace.
 const (
-	pluginName    = "opencode-go-provider"
-	pluginVersion = "2.2.0"
+	pluginName    = "easycliproxyapi-opencode-provider"
+	pluginVersion = "2.3.0"
 )
 
 // githubRepoURL satisfies the host's validPlugin gate (host.go
