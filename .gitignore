@@ -1,0 +1,6 @@
+# Build artifacts (release assets are produced by CI, not committed)
+build/*.so
+build/*.dll
+build/*.dylib
+build/*.h
+dist/
