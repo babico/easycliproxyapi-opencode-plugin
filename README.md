@@ -4,6 +4,35 @@ A native dynamic Go plugin for [CLIProxyAPI](https://help.router-for.me/plugin/d
 
 The plugin unifies model discovery, protocol translation, and execution across OpenCode Go's upstream endpoints while leveraging CLIProxyAPI's built-in authentication, scheduling, keys rotation, and cooldown management.
 
+This repository is the org source repo for the OpenCode Go EasyCLI provider
+plugin (`simple-central-ai-things`), deployed into the EasyCLI/CLIProxyAPI
+bridge served by `simple-central-proxy-manager` (`easycli-proxy/`, LAN port
+`8792`). It keeps its functional `easycliproxyapi-<provider>-plugin` name (no
+SC short name) because the plugin id and the store-polled repo URL are bound
+to the binary. See `AGENTS.md` for contracts, build/test and deploy notes.
+
+## Known gap: repo source (v1.0.3) vs live deployment (v2.3.0)
+
+> [!WARNING]
+> This repository currently holds the **upstream v1.0.3 source**: plugin id
+> `opencode-go-provider`, library `opencode-go-provider.so`, config block
+> `plugins.configs.opencode-go-provider`, CLIProxyAPI v7 SDK
+> (`github.com/router-for-me/CLIProxyAPI/v7 v7.2.138` in `go.mod`), and a
+> single-`base-url` config schema. The plugin running in the live EasyCLI
+> deployment is `easycliproxyapi-opencode-provider.so` **v2.3.0** with the
+> plugin id renamed to `easycliproxyapi-opencode-provider` (config block
+> `plugins.configs.easycliproxyapi-opencode-provider`), running under
+> CLIProxyAPI v8 with a `plans:`-based config schema (per-plan base-url and
+> model prefix) that this source's `internal/config` does not support.
+>
+> The v2.3.0 source was never pushed to any repository; the binary on the
+> deploy host is canonical until the source is recovered or re-derived. Do not
+> build from this repo and overwrite the live plugin. Until the source is
+> recovered, this README and `AGENTS.md` describe the v1.0.3 source, while the
+> docs hub page (`simple-central-ai-things/docs` →
+> `repos/easycliproxyapi-opencode-plugin.md`) documents the live v2.3.0
+> identity — the two intentionally disagree.
+
 ## The Problem
 
 OpenCode Go exposes models across multiple API protocols (OpenAI Chat Completions `/v1/chat/completions`, Anthropic Messages `/v1/messages`, and OpenAI Responses `/v1/responses`).
@@ -35,6 +64,49 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
 - **Config-authoritative credentials**: `api-keys` is the single source of truth. Every configured key is materialized as a CPA auth record; a key removed from the config has its record **deleted** (the auth file is unlinked, since the plugin ABI has no delete callback, and CPA's auth-directory watcher unregisters it), and putting the key back recreates it. Records the plugin cannot prove it created are never touched. See [Credential reconciliation](#credential-reconciliation).
 - **OpenCode Go Quota Page**: Management Center includes a separate `OpenCode Go Quota` page. Page load lists credentials without contacting OpenCode; each card is refreshed manually and independently, and quota values do not affect routing or CPA's native quota page.
 
+## Layout
+
+```text
+main.go                    CGO glue: cliproxy_plugin_init / cliproxyPluginCall ABI exports; every RPC forwarded to internal/plugin.HandleCall
+registry.json              plugin-store identity: id opencode-go-provider, version, upstream fork repo URL
+resources/quota_page.html  embedded Management Center page (/quota, menu "OpenCode Go Quota")
+internal/plugin/           dispatcher, registration metadata, executor, credential reconciliation, quota handler
+internal/adapter/          protocol translation: chatcompletions/, messages/, responses/, shared/
+internal/catalog/          model catalog discovery + normalization
+internal/config/           plugins.configs.<id> schema: api-keys, base-url, catalog-url, model-prefix, catalog, protocols, route-overrides, request-timeout, max-response-bytes, allow-http
+internal/errclass/         error classification + explainable upstream error reporting
+internal/thinking/         numeric Anthropic budget -> effort-level conversion
+tests/live_*_test.go       live regression tests behind the `live` build tag (CI runs offline)
+.github/workflows/         tests.yml (vet + test + glibc build) and build.yml (release matrix + tag releases)
+```
+
+## Contracts
+
+- **Plugin id (this source):** `opencode-go-provider`; provider id and model
+  prefix `opencode-go` — models publish as `opencode-go/<model>` under
+  `/v1/models`.
+- **Live plugin id:** `easycliproxyapi-opencode-provider` (v2.3.0 — see the
+  [Known gap](#known-gap-repo-source-v103-vs-live-deployment-v230) above).
+  Provider and model identity are unchanged across the rename.
+- **Config:** `plugins.configs.opencode-go-provider` in the EasyCLI
+  `config.yaml`; full option table under [Configuration](#configuration).
+  `api-keys` is required and supports `${ENV_VAR}` expansion.
+- **Env keys (names only):** the live deployment feeds `OPENCODE_GO_API_KEY_1/2`
+  from the SCSM `tag:easycli` export rendered by SCPM
+  `easycli-proxy/deploy.sh` into the container `.env`.
+- **Auth records:** `opencode-go-key-<sha256(api_key)>.json` in the CPA auth
+  directory, reconciled against `api-keys` on every register/reconfigure
+  (see [Credential reconciliation](#credential-reconciliation)). API-key
+  only — no OAuth login flow.
+- **Management API:** `POST /plugins/opencode-go-provider/quota-usage` and the
+  `/quota` resource (menu "OpenCode Go Quota"); quota display never affects
+  routing.
+- **Host contract:** CLIProxyAPI native plugin ABI
+  (`github.com/router-for-me/CLIProxyAPI/v7 v7.2.138`). The EasyCLI stack
+  itself (container, config, deploy) is owned by
+  `simple-central-proxy-manager/easycli-proxy` and serves the
+  OpenAI-compatible API on LAN port `8792`.
+
 ## Requirements
 
 - **CLIProxyAPI**: `v7.2.138+`
@@ -60,6 +132,26 @@ go build -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-provider.dylib 
 ```
 
 Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
+
+## Deploy
+
+The org deployment installs the plugin by hand (not through the plugin store):
+
+1. Build the glibc library for the EasyCLI host
+   (`CGO_ENABLED=1 go build -buildmode=c-shared -o plugins/linux/amd64/opencode-go-provider.so .`).
+2. Copy it into the EasyCLI bind-mounted plugins directory
+   (`plugins/linux/amd64/`) on the deploy host.
+3. Ensure a `plugins.configs.opencode-go-provider` block with env-expanded
+   `api-keys` exists in the EasyCLI `config.yaml` (panel-managed — see SCPM
+   `easycli-proxy` for the template and deploy scripts).
+4. Recreate the EasyCLI container and verify the plugin registers (catalog
+   refresh log) before relying on `opencode-go/<model>`.
+
+> [!WARNING]
+> While the [Known gap](#known-gap-repo-source-v103-vs-live-deployment-v230)
+> is open, step 2 must NOT overwrite the live v2.3.0 binary: a build from this
+> repo carries the older v1.0.3 identity, and its CPA v7 SDK generation is
+> unverified against the live CLIProxyAPI v8 host.
 
 ## Error reporting and failover
 
@@ -204,7 +296,7 @@ On Anthropic Messages routes, mixed parts stay inside their associated `tool_res
 
 ## Install via the plugin store
 
-This plugin is listed in the official CLIProxyAPI plugin store under the id `opencode-go-provider`, so Management Center → Plugin Store installs and updates it from this repository's GitHub releases without any extra configuration. The release assets follow the store layout (`opencode-go-provider_<version>_<goos>_<goarch>.zip` plus `checksums.txt`).
+This plugin is listed in the official CLIProxyAPI plugin store under the id `opencode-go-provider`, so Management Center → Plugin Store installs and updates it without any extra configuration. Store lookups resolve releases from the `repository` field of `registry.json` — the upstream fork `xspeed1989/opencode-go-cliproxyapi` — not from this repository's releases. The release assets follow the store layout (`opencode-go-provider_<version>_<goos>_<goarch>.zip` plus `checksums.txt`). In the org's live deployment the plugin is installed by hand instead (see [Deploy](#deploy)).
 
 The plugin id was renamed from `opencode-go-cliproxyapi` to `opencode-go-provider` in v1.0.0. The upstream repository `massiveits/opencode-go-cliproxyapi` owns the old id in the official registry, and a registry cannot list the same id twice, so this fork ships under its own id. The provider name `opencode-go` and every model prefix (`opencode-go/glm-5.2`, …) are unchanged; only the plugin identity, the library filename and the `plugins.configs.<id>` key moved.
 
