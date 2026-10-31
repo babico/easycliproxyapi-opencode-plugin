@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.7"
+      - name: go vet
+        run: go vet ./...
+      # The tests/live_*_test.go regression tests sit behind the `live`
+      # build tag, so `go test ./...` runs offline and secret-free.
+      - name: go test
+        run: go test ./...
+      # glibc host build: the CLIProxyAPI container image is Debian-based,
+      # so the .so must be built for glibc (musl fails to dlopen there).
+      - name: c-shared build (linux/amd64, glibc host)
+        run: CGO_ENABLED=1 go build -buildmode=c-shared -o plugins/linux/amd64/opencode-go-provider.so .
